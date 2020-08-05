@@ -1,9 +1,8 @@
 // Copyright (c) 2009-2010 Satoshi Nakamoto
 // Copyright (c) 2009-2016 The Bitcoin Core developers
 // Copyright (c) 2017-2018 The Bitcoin developers
-// Copyright (c) 2018 The Bitcoin SV developers
-// Distributed under the MIT software license, see the accompanying
-// file COPYING or http://www.opensource.org/licenses/mit-license.php.
+// Copyright (c) 2018-2019 Bitcoin Association
+// Distributed under the Open BSV software license, see the accompanying file LICENSE.
 
 #ifndef BITCOIN_SCRIPT_SCRIPTFLAGS_H
 #define BITCOIN_SCRIPT_SCRIPTFLAGS_H
@@ -92,13 +91,18 @@ enum {
     //
     SCRIPT_ENABLE_SIGHASH_FORKID = (1U << 16),
 
-    // Do we accept activate replay protection using a different fork id.
-    //
-    SCRIPT_ENABLE_REPLAY_PROTECTION = (1U << 17),
 
-    // Are the Magnetic upgrade opcodes enabled?
+    // Is Genesis enabled - transcations that is being executed is part of block that uses Geneisis rules.
     //
-    SCRIPT_ENABLE_MAGNETIC_OPCODES = (1U << 19),
+    SCRIPT_GENESIS = (1U << 18),
+
+    // UTXO being used in this script was created *after* Genesis upgrade
+    // has been activated. This activates new rules (such as original meaning of OP_RETURN)
+    // This is per (input!) UTXO flag
+    SCRIPT_UTXO_AFTER_GENESIS = (1U << 19),
+
+    // Not actual flag. Used for marking largest flag value.
+    SCRIPT_FLAG_LAST = (1U << 20)
 };
 
 #endif // BITCOIN_SCRIPT_SCRIPTFLAGS_H

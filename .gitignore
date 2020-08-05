@@ -4,6 +4,7 @@
 src/bitcoin
 src/bitcoind
 src/bitcoin-cli
+src/bitcoin-miner
 src/bitcoin-seeder
 src/bitcoin-tx
 src/test/test_bitcoin
@@ -98,3 +99,8 @@ contrib/devtools/split-debug.sh
 
 # vagrant
 .vagrant
+
+.vscode
+
+# JetBrains, Clion, PyCharm etc...
+.idea

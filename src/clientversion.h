@@ -1,6 +1,6 @@
 // Copyright (c) 2009-2016 The Bitcoin Core developers
-// Distributed under the MIT software license, see the accompanying
-// file COPYING or http://www.opensource.org/licenses/mit-license.php.
+// Copyright (c) 2019 Bitcoin Association
+// Distributed under the Open BSV software license, see the accompanying file LICENSE.
 
 #ifndef BITCOIN_CLIENTVERSION_H
 #define BITCOIN_CLIENTVERSION_H
@@ -15,9 +15,9 @@
 
 //! These need to be macros, as clientversion.cpp's and bitcoin*-res.rc's voodoo
 //! requires it
-#define CLIENT_VERSION_MAJOR 0
-#define CLIENT_VERSION_MINOR 1
-#define CLIENT_VERSION_REVISION 0
+#define CLIENT_VERSION_MAJOR 1
+#define CLIENT_VERSION_MINOR 0
+#define CLIENT_VERSION_REVISION 4
 #define CLIENT_VERSION_BUILD 0
 
 //! Set to true for release, false for prerelease or test build
@@ -27,7 +27,7 @@
  * Copyright year (2009-this)
  * Todo: update this when changing our copyright comments in the source
  */
-#define COPYRIGHT_YEAR 2018
+#define COPYRIGHT_YEAR 2020
 
 #endif // HAVE_CONFIG_H
 

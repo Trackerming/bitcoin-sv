@@ -25,6 +25,7 @@
 #include <cstdint>
 #include <exception>
 #include <map>
+#include <numeric>
 #include <string>
 #include <vector>
 
@@ -66,9 +67,9 @@ template <typename... Args> bool error(const char *fmt, const Args &... args) {
 
 void PrintExceptionContinue(const std::exception *pex, const char *pszThread);
 void FileCommit(FILE *file);
-bool TruncateFile(FILE *file, unsigned int length);
+bool TruncateFile(FILE *file, uint64_t length);
 int RaiseFileDescriptorLimit(int nMinFD);
-void AllocateFileRange(FILE *file, unsigned int offset, unsigned int length);
+void AllocateFileRange(FILE *file, unsigned int offset, uint64_t length);
 bool RenameOver(fs::path src, fs::path dest);
 bool TryCreateDirectories(const fs::path &p);
 fs::path GetDefaultDataDir();
@@ -196,6 +197,7 @@ std::string HelpMessageOpt(const std::string &option,
 int GetNumCores();
 
 void RenameThread(const char *name);
+std::string GetThreadName();
 
 /**
  * .. and a wrapper that just calls func once
@@ -220,5 +222,23 @@ template <typename Callable> void TraceThread(const char *name, Callable func) {
 }
 
 std::string CopyrightHolders(const std::string &strPrefix);
+
+/**
+ * A reusable average function.
+ * Pre-condition: [first, last) is non-empty.
+ */
+template<typename InputIterator>
+auto Average(InputIterator first, InputIterator last)
+{
+    auto rangeSize { std::distance(first, last) };
+    if(rangeSize == 0)
+    {
+        throw std::runtime_error("0 elements for Average");
+    }
+
+    using T = typename InputIterator::value_type;
+    T sum = std::accumulate(first, last, T{});
+    return sum / rangeSize;
+}
 
 #endif // BITCOIN_UTIL_H

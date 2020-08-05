@@ -60,7 +60,7 @@ class CSeederNode {
         }
         uint32_t nSize = vSend.size() - nMessageStart;
         memcpy((char *)&vSend[nHeaderStart] +
-                   offsetof(CMessageHeader, nMessageSize),
+                   offsetof(CMessageHeader, nPayloadLength),
                &nSize, sizeof(nSize));
         if (vSend.GetVersion() >= 209) {
             uint256 hash = Hash(vSend.begin() + nMessageStart, vSend.end());
@@ -210,29 +210,29 @@ class CSeederNode {
                 return true;
             }
             std::string strCommand = hdr.GetCommand();
-            unsigned int nMessageSize = hdr.nMessageSize;
-            if (nMessageSize > MAX_SIZE) {
+            unsigned int nPayloadLength = hdr.nPayloadLength;
+            if (nPayloadLength > MAX_SIZE) {
                 // printf("%s: BAD (message too large)\n",
                 // ToString(you).c_str());
                 ban = 100000;
                 return true;
             }
-            if (nMessageSize > vRecv.size()) {
+            if (nPayloadLength > vRecv.size()) {
                 vRecv.insert(vRecv.begin(), vHeaderSave.begin(),
                              vHeaderSave.end());
                 break;
             }
             if (vRecv.GetVersion() >= 209) {
                 uint256 hash =
-                    Hash(vRecv.begin(), vRecv.begin() + nMessageSize);
+                    Hash(vRecv.begin(), vRecv.begin() + nPayloadLength);
                 if (memcmp(hash.begin(), hdr.pchChecksum,
                            CMessageHeader::CHECKSUM_SIZE) != 0) {
                     continue;
                 }
             }
-            CDataStream vMsg(vRecv.begin(), vRecv.begin() + nMessageSize,
+            CDataStream vMsg(vRecv.begin(), vRecv.begin() + nPayloadLength,
                              vRecv.GetType(), vRecv.GetVersion());
-            vRecv.ignore(nMessageSize);
+            vRecv.ignore(nPayloadLength);
             if (ProcessMessage(strCommand, vMsg)) return true;
             //      printf("%s: done processing %s\n", ToString(you).c_str(),
             //      strCommand.c_str());
@@ -268,8 +268,11 @@ public:
                    sock != INVALID_SOCKET) {
             char pchBuf[0x10000];
             fd_set set;
+            fd_set exceptSet;
             FD_ZERO(&set);
+            FD_ZERO(&exceptSet);
             FD_SET(sock, &set);
+            FD_SET(sock, &exceptSet);
             struct timeval wa;
             if (doneAfter) {
                 wa.tv_sec = doneAfter - now;
@@ -278,7 +281,7 @@ public:
                 wa.tv_sec = GetTimeout();
                 wa.tv_usec = 0;
             }
-            int ret = select(sock + 1, &set, nullptr, &set, &wa);
+            int ret = select(sock + 1, &set, nullptr, &exceptSet, &wa);
             if (ret != 1) {
                 if (!doneAfter) res = false;
                 break;

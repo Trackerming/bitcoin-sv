@@ -1,14 +1,18 @@
 // Copyright (c) 2018 The Bitcoin developers
-// Copyright (c) 2018 The Bitcoin SV developers
-// Distributed under the MIT software license, see the accompanying
-// file COPYING or http://www.opensource.org/licenses/mit-license.php.
+// Copyright (c) 2018-2019 Bitcoin Association
+// Distributed under the Open BSV software license, see the accompanying file LICENSE.
 
 #include "test/test_bitcoin.h"
 
-#include "policy/policy.h"
-#include "script/interpreter.h"
-#include "script/sign.h"
 #include "keystore.h"
+#include "policy/policy.h"
+#include "script/int_serialization.h"
+#include "script/interpreter.h"
+#include "script/script_num.h"
+#include "script/sign.h"
+#include "taskcancellation.h"
+#include "config.h"
+#include "script/limitedstack.h"
 
 #include <boost/test/unit_test.hpp>
 
@@ -17,105 +21,149 @@
 typedef std::vector<uint8_t> valtype;
 typedef std::vector<valtype> stacktype;
 
-constexpr uint32_t SCRIPT_DISABLE_MAGNETIC_OPCODES = 0;
-
-std::array<uint32_t, 3> flagset{
-    {0, STANDARD_SCRIPT_VERIFY_FLAGS, MANDATORY_SCRIPT_VERIFY_FLAGS}};
+std::array<uint32_t, 3> flagset{{0, STANDARD_SCRIPT_VERIFY_FLAGS, MANDATORY_SCRIPT_VERIFY_FLAGS}};
 
 BOOST_FIXTURE_TEST_SUITE(opcode_tests, BasicTestingSetup)
+
+static void CheckStackSize(const std::vector<valtype> &original_stack_elements, const CScript &script,
+    ScriptError expected_error, uint32_t maxStackSize, const std::vector<valtype> &expected_stack_elements={})
+{
+    Config& config = GlobalConfig::GetConfig();
+    BaseSignatureChecker sigchecker;
+    ScriptError err = SCRIPT_ERR_OK;
+    auto source = task::CCancellationSource::Make();
+
+    LimitedStack stack = LimitedStack(original_stack_elements, maxStackSize);
+
+    auto r =
+        EvalScript(
+            config, true,
+            source->GetToken(),
+            stack,
+            script,
+            flagset[0] | 0,
+            sigchecker,
+            &err);
+
+    if (expected_error == SCRIPT_ERR_OK)
+    {
+        LimitedStack expected = LimitedStack(expected_stack_elements, maxStackSize);
+        BOOST_CHECK(r.value());
+        BOOST_CHECK(stack == expected);
+    } else 
+    {
+        BOOST_CHECK(!r.value());
+        BOOST_CHECK_EQUAL(err, expected_error);
+    }
+   
+}
 
 /**
  * General utility functions to check for script passing/failing.
  */
-static void CheckTestResultForAllFlags(const stacktype &original_stack,
-                                       const CScript &script,
-                                       const stacktype &expected,
-                                       uint32_t upgradeFlag = 0) {
+static void CheckTestResultForAllFlags(const stacktype &original_stack, const CScript &script, const stacktype &expected,
+        uint32_t upgradeFlag = 0) {
+    const Config& config = GlobalConfig::GetConfig();
+
     BaseSignatureChecker sigchecker;
+    auto source = task::CCancellationSource::Make();
 
     for (uint32_t flags : flagset) {
         ScriptError err = SCRIPT_ERR_OK;
-        stacktype stack{original_stack};
-        bool r = EvalScript(stack, script, flags | upgradeFlag, sigchecker, &err);
-        BOOST_CHECK(r);
-        BOOST_CHECK(stack == expected);
 
-        // Make sure that if we do not pass the upgrade flag, opcodes are still
-        // disabled.
-        if(upgradeFlag)
-        {
-            stack = original_stack;
-            r = EvalScript(stack, script, flags, sigchecker, &err);
-            BOOST_CHECK(!r);
-            BOOST_CHECK_EQUAL(err, SCRIPT_ERR_DISABLED_OPCODE);
+        LimitedStack stack = LimitedStack(original_stack, UINT32_MAX);
+        LimitedStack expectedStack = LimitedStack(expected, UINT32_MAX);
+        auto r =
+            EvalScript(
+                config, true,
+                source->GetToken(),
+                stack,
+                script,
+                flags | upgradeFlag,
+                sigchecker,
+                &err);
+        BOOST_CHECK(r.value());
+        BOOST_CHECK(stack == expectedStack);
+
+        // Make sure that if we do not pass the upgrade flag, we get the same result
+        if (upgradeFlag) {
+            stack = LimitedStack(original_stack, UINT32_MAX);
+            r =
+                EvalScript(
+                    config, true,
+                    source->GetToken(),
+                    stack,
+                    script,
+                    flags,
+                    sigchecker,
+                    &err);
+            BOOST_CHECK(r.value());
+            BOOST_CHECK(stack == expectedStack);
         }
     }
-}
-
-// magnetic upgrade
-static void CheckTestResultForAllFlagsMagnetic(const stacktype &original_stack,
-                                               const CScript &script,
-                                               const stacktype &expected) {
-    CheckTestResultForAllFlags(original_stack, script, expected, SCRIPT_ENABLE_MAGNETIC_OPCODES);
 }
 
 static void CheckError(uint32_t flags, const stacktype &original_stack,
                        const CScript &script, ScriptError expected_error, uint32_t upgradeFlag = 0) {
     BaseSignatureChecker sigchecker;
+    const Config& config = GlobalConfig::GetConfig();
     ScriptError err = SCRIPT_ERR_OK;
-    stacktype stack{original_stack};
-    bool r = EvalScript(stack, script, flags | upgradeFlag, sigchecker, &err);
-    BOOST_CHECK(!r);
+    LimitedStack stack = LimitedStack(original_stack, UINT32_MAX);
+
+    auto source = task::CCancellationSource::Make();
+    auto r =
+        EvalScript(
+            config, true,
+            source->GetToken(),
+            stack,
+            script,
+            flags | upgradeFlag,
+            sigchecker,
+            &err);
+    BOOST_CHECK(!r.value());
+
     BOOST_CHECK_EQUAL(err, expected_error);
 
-    // Make sure that if we do not pass the opcodes flags, opcodes are still
-    // disabled.
+    // Make sure that if we do not pass the opcodes flags, we get the same result
     if(upgradeFlag)
     {
-        stack = original_stack;
-        r = EvalScript(stack, script, flags, sigchecker, &err);
-        BOOST_CHECK(!r);
-        BOOST_CHECK_EQUAL(err, SCRIPT_ERR_DISABLED_OPCODE);
+        stack = LimitedStack(original_stack, UINT32_MAX);
+        r =
+            EvalScript(
+                config, true,
+                source->GetToken(),
+                stack,
+                script,
+                flags,
+                sigchecker,
+                &err);
+        BOOST_CHECK(!r.value());
+        BOOST_CHECK_EQUAL(err, expected_error);
     }
 }
 
-static void CheckErrorForAllFlags(const stacktype &original_stack, const CScript &script,
-                                  ScriptError expected_error, uint32_t upgradeFlag = 0) {
+static void CheckErrorForAllFlags(const stacktype &original_stack, const CScript &script, ScriptError expected_error, uint32_t upgradeFlag = 0) {
     for (uint32_t flags : flagset) {
         CheckError(flags, original_stack, script, expected_error, upgradeFlag);
     }
 }
 
-// magnetic upgrade
-static void CheckErrorForAllFlagsMagnetic(const stacktype &original_stack, const CScript &script,
-                                  ScriptError expected_error) {
-    CheckErrorForAllFlags(original_stack, script, expected_error, SCRIPT_ENABLE_MAGNETIC_OPCODES);
-}
-
-static void CheckOpError(const stacktype &original_stack, opcodetype op,
-                         ScriptError expected_error) {
+static void CheckOpError(const stacktype &original_stack, opcodetype op, ScriptError expected_error) {
     CheckErrorForAllFlags(original_stack, CScript() << op, expected_error);
 }
 
-static void CheckAllBitwiseOpErrors(const stacktype &stack,
-                                    ScriptError expected_error) {
+static void CheckAllBitwiseOpErrors(const stacktype &stack, ScriptError expected_error) {
     CheckOpError(stack, OP_AND, expected_error);
     CheckOpError(stack, OP_OR, expected_error);
     CheckOpError(stack, OP_XOR, expected_error);
 }
 
-static void CheckBinaryOp(const valtype &a, const valtype &b, opcodetype op,
-                          const valtype &expected) {
+static void CheckBinaryOp(const valtype &a, const valtype &b, opcodetype op, const valtype &expected) {
     CheckTestResultForAllFlags({a, b}, CScript() << op, {expected});
 }
 
-static void CheckBinaryOpMagnetic(const valtype &a, const valtype &b, opcodetype op,
-                          const valtype &expected) {
-    CheckTestResultForAllFlagsMagnetic({a, b}, CScript() << op, {expected});
-}
-
-static void CheckUnaryOpMagnetic(const valtype &a, opcodetype op, const valtype &expected) {
-    CheckTestResultForAllFlagsMagnetic({a}, CScript() << op, {expected});
+static void CheckUnaryOp(const valtype &a, opcodetype op, const valtype &expected) {
+    CheckTestResultForAllFlags({a}, CScript() << op, {expected});
 }
 
 static valtype NegativeValtype(const valtype &v) {
@@ -123,7 +171,7 @@ static valtype NegativeValtype(const valtype &v) {
     if (r.size() > 0) {
         r[r.size() - 1] ^= 0x80;
     }
-    CScriptNum::MinimallyEncode(r);
+    bsv::MinimallyEncode(r);
     return r;
 }
 
@@ -269,11 +317,11 @@ BOOST_AUTO_TEST_CASE(bitwise_opcodes_test) {
     RunTestForAllBitwiseOpcodes({}, {}, {}, {}, {});
 
     // Run all variations of zeros and ones.
-    valtype allzeros(MAX_SCRIPT_ELEMENT_SIZE, 0);
-    valtype allones(MAX_SCRIPT_ELEMENT_SIZE, 0xff);
+    valtype allzeros(MAX_SCRIPT_ELEMENT_SIZE_BEFORE_GENESIS, 0);
+    valtype allones(MAX_SCRIPT_ELEMENT_SIZE_BEFORE_GENESIS, 0xff);
 
-    BOOST_CHECK_EQUAL(allzeros.size(), MAX_SCRIPT_ELEMENT_SIZE);
-    BOOST_CHECK_EQUAL(allones.size(), MAX_SCRIPT_ELEMENT_SIZE);
+    BOOST_CHECK_EQUAL(allzeros.size(), MAX_SCRIPT_ELEMENT_SIZE_BEFORE_GENESIS);
+    BOOST_CHECK_EQUAL(allones.size(), MAX_SCRIPT_ELEMENT_SIZE_BEFORE_GENESIS);
 
     TestBitwiseOpcodes(allzeros, allzeros, allzeros, allzeros);
     TestBitwiseOpcodes(allzeros, allones, allzeros, allones);
@@ -371,8 +419,8 @@ BOOST_AUTO_TEST_CASE(bitwise_opcodes_test) {
         0xc9, 0x4d, 0xb9, 0x07, 0x71, 0x6d, 0xd1, 0x96, 0xc3, 0x88, 0xb6, 0xe6,
         0x0e, 0x8a, 0x8a, 0xd7};
 
-    BOOST_CHECK_EQUAL(a.size(), MAX_SCRIPT_ELEMENT_SIZE);
-    BOOST_CHECK_EQUAL(b.size(), MAX_SCRIPT_ELEMENT_SIZE);
+    BOOST_CHECK_EQUAL(a.size(), MAX_SCRIPT_ELEMENT_SIZE_BEFORE_GENESIS);
+    BOOST_CHECK_EQUAL(b.size(), MAX_SCRIPT_ELEMENT_SIZE_BEFORE_GENESIS);
 
     valtype aandb{
         0x10, 0x0e, 0x18, 0x01, 0x83, 0x00, 0x1a, 0x00, 0x41, 0x8c, 0x00, 0x00,
@@ -489,19 +537,19 @@ BOOST_AUTO_TEST_CASE(bitwise_opcodes_test) {
 }
 
 BOOST_AUTO_TEST_CASE(invert_test)
-{ 
-    CheckUnaryOpMagnetic({},     OP_INVERT, {});
-    CheckUnaryOpMagnetic({0x00}, OP_INVERT, {0xFF});
-    CheckUnaryOpMagnetic({0xFF}, OP_INVERT, {0x00});
-    CheckUnaryOpMagnetic({0xFF, 0xA0, 0xCE, 0xA0, 0x96, 0x12}, OP_INVERT, {0x00, 0x5F, 0x31, 0x5F, 0x69, 0xED});
+{
+    CheckUnaryOp({},     OP_INVERT, {});
+    CheckUnaryOp({0x00}, OP_INVERT, {0xFF});
+    CheckUnaryOp({0xFF}, OP_INVERT, {0x00});
+    CheckUnaryOp({0xFF, 0xA0, 0xCE, 0xA0, 0x96, 0x12}, OP_INVERT, {0x00, 0x5F, 0x31, 0x5F, 0x69, 0xED});
 } 
 
 static void CheckShiftOp(const valtype &x, const valtype &n, opcodetype op, const valtype &expected) {
-    CheckBinaryOpMagnetic(x, n, op, expected);
+    CheckBinaryOp(x, n, op, expected);
 }
 
 BOOST_AUTO_TEST_CASE(lshift_test)
-{ 
+{
     CheckShiftOp({}, {},     OP_LSHIFT, {}); 
     CheckShiftOp({}, {0x01}, OP_LSHIFT, {}); 
     CheckShiftOp({}, {0x02}, OP_LSHIFT, {}); 
@@ -511,7 +559,7 @@ BOOST_AUTO_TEST_CASE(lshift_test)
     CheckShiftOp({}, {0x0F}, OP_LSHIFT, {}); 
     CheckShiftOp({}, {0x10}, OP_LSHIFT, {}); 
     CheckShiftOp({}, {0x11}, OP_LSHIFT, {}); 
- 
+
     CheckShiftOp({0xFF}, {},     OP_LSHIFT, to_bitpattern("11111111")); 
     CheckShiftOp({0xFF}, {0x01}, OP_LSHIFT, to_bitpattern("11111110")); 
     CheckShiftOp({0xFF}, {0x02}, OP_LSHIFT, to_bitpattern("11111100")); 
@@ -521,7 +569,7 @@ BOOST_AUTO_TEST_CASE(lshift_test)
     CheckShiftOp({0xFF}, {0x06}, OP_LSHIFT, to_bitpattern("11000000")); 
     CheckShiftOp({0xFF}, {0x07}, OP_LSHIFT, to_bitpattern("10000000")); 
     CheckShiftOp({0xFF}, {0x08}, OP_LSHIFT, to_bitpattern("00000000")); 
- 
+
     CheckShiftOp({0xFF}, {0x01}, OP_LSHIFT, {0xFE}); 
     CheckShiftOp({0xFF}, {0x02}, OP_LSHIFT, {0xFC}); 
     CheckShiftOp({0xFF}, {0x03}, OP_LSHIFT, {0xF8}); 
@@ -559,8 +607,7 @@ BOOST_AUTO_TEST_CASE(lshift_test)
     CheckShiftOp({0x9F, 0x11, 0xF5, 0x55}, {0x0F}, OP_LSHIFT, to_bitpattern("11111010101010101000000000000000"));
 
     // second parameter, n < 0 - should produce error
-    CheckErrorForAllFlagsMagnetic({valtype{0x12, 0x34}}, CScript() << OP_1NEGATE << OP_LSHIFT,
-                          SCRIPT_ERR_INVALID_NUMBER_RANGE); 
+    CheckErrorForAllFlags({{0x12, 0x34}}, CScript() << OP_1NEGATE << OP_LSHIFT, SCRIPT_ERR_INVALID_NUMBER_RANGE);
 } 
  
 BOOST_AUTO_TEST_CASE(rshift_test) 
@@ -623,8 +670,57 @@ BOOST_AUTO_TEST_CASE(rshift_test)
     CheckShiftOp({0x9F, 0x11, 0xF5, 0x55}, {0x0F}, OP_RSHIFT, to_bitpattern("00000000000000010011111000100011"));
 
     // second parameter, n < 0 - should produce error
-    CheckErrorForAllFlagsMagnetic({valtype{0x12, 0x34}}, CScript() << OP_1NEGATE << OP_RSHIFT,
-                          SCRIPT_ERR_INVALID_NUMBER_RANGE);
+    CheckErrorForAllFlags({{0x12, 0x34}}, CScript() << OP_1NEGATE << OP_RSHIFT, SCRIPT_ERR_INVALID_NUMBER_RANGE);
+}
+
+BOOST_AUTO_TEST_CASE(rshift_big_int)
+{
+    constexpr std::vector<uint8_t>::size_type size{INT32_MAX};
+    std::vector<uint8_t> data(size + 1l, 0x00);
+    data[0] = 0x80;
+
+    Config& config = GlobalConfig::GetConfig();
+    BaseSignatureChecker sigchecker;
+    auto source = task::CCancellationSource::Make();
+    ScriptError err = SCRIPT_ERR_OK;
+
+    LimitedStack stack = LimitedStack({data}, INT64_MAX);
+    auto r =
+        EvalScript(
+            config, true,
+            source->GetToken(),
+            stack,
+            CScript() << 1 << OP_RSHIFT,
+            flagset[0] | SCRIPT_UTXO_AFTER_GENESIS,
+            sigchecker,
+            &err);
+    BOOST_CHECK(r.value());
+    BOOST_CHECK(stack.front().GetElement()[0] == 0x40);
+}
+
+BOOST_AUTO_TEST_CASE(lshift_big_int)
+{
+    constexpr std::vector<uint8_t>::size_type size{INT32_MAX};
+    std::vector<uint8_t> data(size + 2l, 0x00);
+    data[0] = 0x40;
+
+    Config& config = GlobalConfig::GetConfig();
+    BaseSignatureChecker sigchecker;
+    auto source = task::CCancellationSource::Make();
+    ScriptError err = SCRIPT_ERR_OK;
+
+    LimitedStack stack = LimitedStack({data}, INT64_MAX);
+    auto r =
+        EvalScript(
+            config, true,
+            source->GetToken(),
+            stack,
+            CScript() << 1 << OP_LSHIFT,
+            flagset[0] | SCRIPT_UTXO_AFTER_GENESIS,
+            sigchecker,
+            &err);
+    BOOST_CHECK(r.value());
+    BOOST_CHECK(stack.front().GetElement()[0] == 0x80);
 }
 
 /**
@@ -722,9 +818,9 @@ BOOST_AUTO_TEST_CASE(string_opcodes_test) {
         0xbe, 0x6b, 0xb1, 0x4c, 0x46, 0x2a, 0x86, 0xd9, 0x2d, 0x20, 0x29, 0xb4,
         0x44, 0x15, 0xb2, 0x7e};
 
-    BOOST_CHECK_EQUAL(n.size(), MAX_SCRIPT_ELEMENT_SIZE);
+    BOOST_CHECK_EQUAL(n.size(), MAX_SCRIPT_ELEMENT_SIZE_BEFORE_GENESIS);
 
-    for (size_t i = 0; i <= MAX_SCRIPT_ELEMENT_SIZE; i++) {
+    for (size_t i = 0; i <= MAX_SCRIPT_ELEMENT_SIZE_BEFORE_GENESIS; i++) {
         valtype a(n.begin(), n.begin() + i);
         valtype b(n.begin() + i, n.end());
 
@@ -779,18 +875,61 @@ static void CheckTypeConversionOp(const valtype &bin, const valtype &num) {
     // Grow and shrink back down using NUM2BIN.
     CheckTestResultForAllFlags({bin},
                                CScript()
-                                   << MAX_SCRIPT_ELEMENT_SIZE << OP_NUM2BIN
+                                   << MAX_SCRIPT_ELEMENT_SIZE_BEFORE_GENESIS << OP_NUM2BIN
                                    << bin.size() << OP_NUM2BIN,
                                {rebuilt_bin});
     CheckTestResultForAllFlags({num},
                                CScript()
-                                   << MAX_SCRIPT_ELEMENT_SIZE << OP_NUM2BIN
+                                   << MAX_SCRIPT_ELEMENT_SIZE_BEFORE_GENESIS << OP_NUM2BIN
                                    << bin.size() << OP_NUM2BIN,
                                {rebuilt_bin});
 
     // BIN2NUM is indempotent.
     CheckTestResultForAllFlags({bin}, CScript() << OP_BIN2NUM << OP_BIN2NUM,
                                {num});
+}
+
+BOOST_AUTO_TEST_CASE(limited_stack_test) {
+
+    // Calling constructor of LimitedStack throws error as we are pushing too much elements to stack.
+    BOOST_CHECK_THROW(
+        LimitedStack({{0xab, 0xcd, 0xef}, {0x12, 0x34, 0x56, 0x78}}, 6 + 2 * LimitedVector::ELEMENT_OVERHEAD),
+        stack_overflow_error);
+
+    CheckStackSize({{0xab, 0xcd, 0xef}, {0x12, 0x34, 0x56, 0x78}}, CScript() << OP_CAT, SCRIPT_ERR_OK, 7 + 2 * LimitedVector::ELEMENT_OVERHEAD,
+        {{0xab, 0xcd, 0xef, 0x12, 0x34, 0x56, 0x78}});
+
+    CheckStackSize({{0xab, 0xcd, 0xef}, {0x12, 0x34, 0x56, 0x78}}, CScript() << OP_TUCK, SCRIPT_ERR_OK, 11 + 3 * LimitedVector::ELEMENT_OVERHEAD,
+        {{0x12, 0x34, 0x56, 0x78}, {0xab, 0xcd, 0xef}, {0x12, 0x34, 0x56, 0x78}});
+
+    CheckStackSize({{0xab, 0xcd, 0xef}, {0x12, 0x34, 0x56, 0x78}}, CScript() << OP_TUCK, SCRIPT_ERR_STACK_SIZE, 10 + 3 * LimitedVector::ELEMENT_OVERHEAD);
+
+    CheckStackSize({{0xab}, {0xcd}, {0xef}, {0x12}, {0x34}, {0x56}, {0x78}}, CScript() << OP_2ROT, SCRIPT_ERR_OK, 7 + 7 * LimitedVector::ELEMENT_OVERHEAD,
+        {{0xab}, {0x12}, {0x34}, {0x56}, {0x78}, {0xcd}, {0xef}});
+
+    CheckStackSize({{0xab}, {0xcd}, {0xef}}, CScript() << OP_ROT, SCRIPT_ERR_OK, 3 + 3 * LimitedVector::ELEMENT_OVERHEAD,
+        {{0xcd}, {0xef}, {0xab}});
+
+    CheckStackSize({{0xab}, {0xcd}, {0xef}, {0x12}, {0x34}}, CScript() << OP_2SWAP, SCRIPT_ERR_OK, 5 + 5 * LimitedVector::ELEMENT_OVERHEAD,
+        {{0xab}, {0x12}, {0x34}, {0xcd}, {0xef}});
+
+    CheckStackSize({{0xab}, {0xcd}, {0xef}}, CScript() << OP_NIP, SCRIPT_ERR_OK, 3 + 3 * LimitedVector::ELEMENT_OVERHEAD,
+        {{0xab}, {0xef}});
+
+    // OP_OVER: (x1 x2 -- x1 x2 x1)
+    CheckStackSize({{0xab}, {0xcd}}, CScript() << OP_OVER, SCRIPT_ERR_OK, 3 + 3 * LimitedVector::ELEMENT_OVERHEAD,
+        {{0xab}, {0xcd}, {0xab}});
+
+    CheckStackSize({{0xab}, {0xcd}}, CScript() << OP_OVER, SCRIPT_ERR_STACK_SIZE, 2 + 2 * LimitedVector::ELEMENT_OVERHEAD);
+
+    // TOALTSTACK should not modify size
+    CheckStackSize({{0xab}}, CScript() << OP_TOALTSTACK, SCRIPT_ERR_OK, 1 + 2 * LimitedVector::ELEMENT_OVERHEAD, {});
+
+    // FROMALTSTACK cannot be used without TOALTSTACK.
+    CheckStackSize({{0xab}}, CScript() << OP_FROMALTSTACK, SCRIPT_ERR_INVALID_ALTSTACK_OPERATION, 1 + 2 * LimitedVector::ELEMENT_OVERHEAD);
+
+    CheckStackSize({{0xab}}, CScript() << OP_TOALTSTACK << OP_FROMALTSTACK, SCRIPT_ERR_OK, 1 + 2 * LimitedVector::ELEMENT_OVERHEAD,
+        {{0xab}});
 }
 
 static void CheckBin2NumError(const stacktype &original_stack,
@@ -801,6 +940,7 @@ static void CheckBin2NumError(const stacktype &original_stack,
 
 static void CheckNum2BinError(const stacktype &original_stack,
                               ScriptError expected_error) {
+
     CheckErrorForAllFlags(original_stack, CScript() << OP_NUM2BIN,
                           expected_error);
 }
@@ -810,7 +950,7 @@ BOOST_AUTO_TEST_CASE(type_conversion_test) {
     CheckTypeConversionOp(empty, empty);
 
     valtype paddedzero, paddednegzero;
-    for (size_t i = 0; i < MAX_SCRIPT_ELEMENT_SIZE; i++) {
+    for (size_t i = 0; i < MAX_SCRIPT_ELEMENT_SIZE_BEFORE_GENESIS; i++) {
         CheckTypeConversionOp(paddedzero, empty);
         paddedzero.push_back(0x00);
 
@@ -822,7 +962,7 @@ BOOST_AUTO_TEST_CASE(type_conversion_test) {
     // Merge leading byte when sign bit isn't used.
     std::vector<uint8_t> k{0x7f}, negk{0xff};
     std::vector<uint8_t> kpadded = k, negkpadded = negk;
-    for (size_t i = 0; i < MAX_SCRIPT_ELEMENT_SIZE; i++) {
+    for (size_t i = 0; i < MAX_SCRIPT_ELEMENT_SIZE_BEFORE_GENESIS; i++) {
         CheckTypeConversionOp(kpadded, k);
         kpadded.push_back(0x00);
 
@@ -856,8 +996,8 @@ BOOST_AUTO_TEST_CASE(type_conversion_test) {
                       SCRIPT_ERR_INVALID_NUMBER_RANGE);
 
     // NUM2BIN must not generate oversized push.
-    valtype largezero(MAX_SCRIPT_ELEMENT_SIZE, 0);
-    BOOST_CHECK_EQUAL(largezero.size(), MAX_SCRIPT_ELEMENT_SIZE);
+    valtype largezero(MAX_SCRIPT_ELEMENT_SIZE_BEFORE_GENESIS, 0);
+    BOOST_CHECK_EQUAL(largezero.size(), MAX_SCRIPT_ELEMENT_SIZE_BEFORE_GENESIS);
     CheckTypeConversionOp(largezero, {});
 
     CheckNum2BinError({{}, {0x09, 0x02}}, SCRIPT_ERR_PUSH_SIZE);
@@ -873,25 +1013,25 @@ BOOST_AUTO_TEST_CASE(type_conversion_test) {
 static void CheckMul(const valtype &a, const valtype &b, const valtype &expected) 
 { 
     // Negative values for multiplication
-    CheckBinaryOpMagnetic(a, b, OP_MUL, expected);
-    CheckBinaryOpMagnetic(a, NegativeValtype(b), OP_MUL, NegativeValtype(expected));
-    CheckBinaryOpMagnetic(NegativeValtype(a), b, OP_MUL, NegativeValtype(expected));
-    CheckBinaryOpMagnetic(NegativeValtype(a), NegativeValtype(b), OP_MUL, expected);
+    CheckBinaryOp(a, b, OP_MUL, expected);
+    CheckBinaryOp(a, NegativeValtype(b), OP_MUL, NegativeValtype(expected));
+    CheckBinaryOp(NegativeValtype(a), b, OP_MUL, NegativeValtype(expected));
+    CheckBinaryOp(NegativeValtype(a), NegativeValtype(b), OP_MUL, expected);
  
     // Commutativity 
-    CheckBinaryOpMagnetic(b, a, OP_MUL, expected);
-    CheckBinaryOpMagnetic(b, NegativeValtype(a), OP_MUL, NegativeValtype(expected));
-    CheckBinaryOpMagnetic(NegativeValtype(b), a, OP_MUL, NegativeValtype(expected));
-    CheckBinaryOpMagnetic(NegativeValtype(b), NegativeValtype(a), OP_MUL, expected);
+    CheckBinaryOp(b, a, OP_MUL, expected);
+    CheckBinaryOp(b, NegativeValtype(a), OP_MUL, NegativeValtype(expected));
+    CheckBinaryOp(NegativeValtype(b), a, OP_MUL, NegativeValtype(expected));
+    CheckBinaryOp(NegativeValtype(b), NegativeValtype(a), OP_MUL, expected);
 
     // Multiplication identities 
-    CheckBinaryOpMagnetic(a, {0x01}, OP_MUL, a);
-    CheckBinaryOpMagnetic(a, {0x81}, OP_MUL, NegativeValtype(a));
-    CheckBinaryOpMagnetic(a, {}, OP_MUL, {});
+    CheckBinaryOp(a, {0x01}, OP_MUL, a);
+    CheckBinaryOp(a, {0x81}, OP_MUL, NegativeValtype(a));
+    CheckBinaryOp(a, {}, OP_MUL, {});
 
-    CheckBinaryOpMagnetic({0x01}, b, OP_MUL, b);
-    CheckBinaryOpMagnetic({0x81}, b, OP_MUL, NegativeValtype(b));
-    CheckBinaryOpMagnetic({}, b, OP_MUL, {});
+    CheckBinaryOp({0x01}, b, OP_MUL, b);
+    CheckBinaryOp({0x81}, b, OP_MUL, NegativeValtype(b));
+    CheckBinaryOp({}, b, OP_MUL, {});
 }
 
 BOOST_AUTO_TEST_CASE(mul_test) 
@@ -933,22 +1073,22 @@ static void CheckDivMod(const valtype &a, const valtype &b,
 
         if (flags & SCRIPT_VERIFY_MINIMALDATA) {
             CheckError(flags, {a, {0x00}}, CScript() << OP_DIV,
-                       SCRIPT_ERR_UNKNOWN_ERROR);
+                       SCRIPT_ERR_SCRIPTNUM_MINENCODE);
             CheckError(flags, {a, {0x80}}, CScript() << OP_DIV,
-                       SCRIPT_ERR_UNKNOWN_ERROR);
+                       SCRIPT_ERR_SCRIPTNUM_MINENCODE);
             CheckError(flags, {a, {0x00, 0x00}}, CScript() << OP_DIV,
-                       SCRIPT_ERR_UNKNOWN_ERROR);
+                       SCRIPT_ERR_SCRIPTNUM_MINENCODE);
             CheckError(flags, {a, {0x00, 0x80}}, CScript() << OP_DIV,
-                       SCRIPT_ERR_UNKNOWN_ERROR);
+                       SCRIPT_ERR_SCRIPTNUM_MINENCODE);
 
             CheckError(flags, {b, {0x00}}, CScript() << OP_DIV,
-                       SCRIPT_ERR_UNKNOWN_ERROR);
+                       SCRIPT_ERR_SCRIPTNUM_MINENCODE);
             CheckError(flags, {b, {0x80}}, CScript() << OP_DIV,
-                       SCRIPT_ERR_UNKNOWN_ERROR);
+                       SCRIPT_ERR_SCRIPTNUM_MINENCODE);
             CheckError(flags, {b, {0x00, 0x00}}, CScript() << OP_DIV,
-                       SCRIPT_ERR_UNKNOWN_ERROR);
+                       SCRIPT_ERR_SCRIPTNUM_MINENCODE);
             CheckError(flags, {b, {0x00, 0x80}}, CScript() << OP_DIV,
-                       SCRIPT_ERR_UNKNOWN_ERROR);
+                       SCRIPT_ERR_SCRIPTNUM_MINENCODE);
         } else {
             CheckError(flags, {a, {0x00}}, CScript() << OP_DIV,
                        SCRIPT_ERR_DIV_BY_ZERO);
@@ -1003,11 +1143,11 @@ BOOST_AUTO_TEST_CASE(div_and_mod_opcode_tests) {
     // CheckOps not valid numbers
     CheckDivModError(
         {{0x01, 0x02, 0x03, 0x04, 0x05}, {0x01, 0x02, 0x03, 0x04, 0x05}},
-        SCRIPT_ERR_UNKNOWN_ERROR);
+        SCRIPT_ERR_SCRIPTNUM_OVERFLOW);
     CheckDivModError({{0x01, 0x02, 0x03, 0x04, 0x05}, {0x01}},
-                     SCRIPT_ERR_UNKNOWN_ERROR);
+                     SCRIPT_ERR_SCRIPTNUM_OVERFLOW);
     CheckDivModError({{0x01, 0x05}, {0x01, 0x02, 0x03, 0x04, 0x05}},
-                     SCRIPT_ERR_UNKNOWN_ERROR);
+                     SCRIPT_ERR_SCRIPTNUM_OVERFLOW);
 
     // 0x185377af / 0x85f41b01 = -4
     // 0x185377af % 0x85f41b01 = 0x00830bab
@@ -1047,11 +1187,11 @@ BOOST_AUTO_TEST_CASE(div_and_mod_opcode_tests) {
 /**
  * Test opcode limits.
  */
-static size_t NonPushOpCodeCount(const CScript& script)
+static uint64_t NonPushOpCodeCount(const CScript& script)
 { 
     CScript::const_iterator pc = script.begin(); 
     CScript::const_iterator pend = script.end(); 
-    size_t cnt = 0; 
+    uint64_t cnt = 0;
     opcodetype opcode; 
     valtype value; 
     while (pc < pend) 
@@ -1061,36 +1201,40 @@ static size_t NonPushOpCodeCount(const CScript& script)
              ++cnt;
     }
     // Include multisig opcode count as well.
-    return cnt + script.GetSigOpCount(true);
+    bool sigOpCountError;
+    return cnt + script.GetSigOpCount(true, false, sigOpCountError);
 } 
  
 static void CheckTestForOpCodeLimit(const CScript &script,
                                     const size_t expNonPushOpcodeCount,
-                                    const BaseSignatureChecker& sigchecker,
-                                    const stacktype &original_stack = {})
+                                    const BaseSignatureChecker& sigchecker)
 { 
-    std::array<uint32_t, 2> release_dependent_flagset {
-        { SCRIPT_DISABLE_MAGNETIC_OPCODES, SCRIPT_ENABLE_MAGNETIC_OPCODES }
-    };
+    const Config& config = GlobalConfig::GetConfig();
+    for (uint32_t flags : flagset) {
+        ScriptError err = SCRIPT_ERR_OK;
 
-    for (uint32_t std_flags : flagset) {
-        for(uint32_t rdep_flags : release_dependent_flagset) {
-            uint32_t flags = std_flags | rdep_flags; 
-            ScriptError err = SCRIPT_ERR_OK; 
-            stacktype stack{original_stack};
-            bool isMagnetic = (rdep_flags & SCRIPT_ENABLE_MAGNETIC_OPCODES);
-            bool r = EvalScript(stack, script, flags, sigchecker, &err);
-            size_t nonPushOpcodeCount = NonPushOpCodeCount(script);
-            if( (isMagnetic && nonPushOpcodeCount > MAGNETIC_MAX_OPS_PER_SCRIPT) ||
-                (!isMagnetic && nonPushOpcodeCount > MAX_OPS_PER_SCRIPT) ) {
-                BOOST_CHECK(!r);
-            }
-            else {
-                BOOST_CHECK(r); 
-            }
-            BOOST_CHECK(nonPushOpcodeCount == expNonPushOpcodeCount);
-	    }
-    } 
+        LimitedStack stack(UINT32_MAX);
+        auto r =
+            EvalScript(
+                config, true,
+                task::CCancellationSource::Make(),
+                stack,
+                script,
+                flags,
+                sigchecker,
+                &err);
+        uint64_t nonPushOpcodeCount = NonPushOpCodeCount(script);
+
+        // // flagset does not contain SCRIPT_UTXO_AFTER_GENESIS flag, so we will test with isGenesisEnabled=false in if
+        BOOST_REQUIRE(!(flags & SCRIPT_UTXO_AFTER_GENESIS));
+        if (nonPushOpcodeCount > config.GetMaxOpsPerScript(false, true))
+        {
+            BOOST_CHECK(!r.value());
+        } else {
+            BOOST_CHECK(r.value());
+        }
+        BOOST_CHECK(nonPushOpcodeCount == expNonPushOpcodeCount);
+    }
 } 
 
 static CScript add_op1_ntimes(size_t nTimes)
@@ -1098,7 +1242,7 @@ static CScript add_op1_ntimes(size_t nTimes)
     CScript script;
     // Initial value
     script << OP_1;
-    for (size_t i=0; i<nTimes; ++i) {
+    for (size_t i = 0; i < nTimes; ++i) {
         script << OP_1 << OP_ADD;
     }
     return script;
@@ -1119,22 +1263,26 @@ static CScript dummy_multisig_with_pubkey()
     return script;
 }
 
-BOOST_AUTO_TEST_CASE(opcode_legacy_limit_tests)
+BOOST_AUTO_TEST_CASE(opcode_limit_tests)
 { 
     DummySignatureCreator sigfactory(nullptr); 
     const BaseSignatureChecker& sigchecker = sigfactory.Checker(); 
 
+    // Test pre-Genesis limits. Policy is tested in functional test.
+    uint64_t testLimit = MAX_OPS_PER_SCRIPT_BEFORE_GENESIS;
+
+    BOOST_CHECK(testLimit == GlobalConfig::GetConfig().GetMaxOpsPerScript(false, true));
     /**
      * Check based on OP_ADD opcode.
      */
     // test with one opcode
     CheckTestForOpCodeLimit(add_op1_ntimes(1), 1, sigchecker);
     // test with MAX_OPS_PER_SCRIPT-1 opcodes, which is under MAX_OPS_PER_SCRIPT legacy limit
-    CheckTestForOpCodeLimit(add_op1_ntimes(MAX_OPS_PER_SCRIPT-1), MAX_OPS_PER_SCRIPT-1, sigchecker);
+    CheckTestForOpCodeLimit(add_op1_ntimes(testLimit-1), testLimit-1, sigchecker);
     // test with MAX_OPS_PER_SCRIPT opcodes, which is equal MAX_OPS_PER_SCRIPT legacy limit
-    CheckTestForOpCodeLimit(add_op1_ntimes(MAX_OPS_PER_SCRIPT), MAX_OPS_PER_SCRIPT, sigchecker);
+    CheckTestForOpCodeLimit(add_op1_ntimes(testLimit), testLimit, sigchecker);
     // test with MAX_OPS_PER_SCRIPT+1 opcodes, which is over MAX_OPS_PER_SCRIPT legacy limit
-    CheckTestForOpCodeLimit(add_op1_ntimes(MAX_OPS_PER_SCRIPT+1), MAX_OPS_PER_SCRIPT+1, sigchecker);
+    CheckTestForOpCodeLimit(add_op1_ntimes(testLimit+1), testLimit+1, sigchecker);
 
     /**
      * Check OP_CHECKMULTISIG/OP_CHECKMULTISIGVERIFY as this
@@ -1143,40 +1291,11 @@ BOOST_AUTO_TEST_CASE(opcode_legacy_limit_tests)
     // Create multi-sig signatures + public keys.
     CScript dummy_multisig (dummy_multisig_with_pubkey());
     // test with MAX_OPS_PER_SCRIPT-5+4 opcodes, which is under MAX_OPS_PER_SCRIPT legacy limit
-    CheckTestForOpCodeLimit(add_op1_ntimes(MAX_OPS_PER_SCRIPT-5) + dummy_multisig, MAX_OPS_PER_SCRIPT-1, sigchecker);
+    CheckTestForOpCodeLimit(add_op1_ntimes(testLimit-5) + dummy_multisig, testLimit-1, sigchecker);
     // test with MAX_OPS_PER_SCRIPT-4+4 opcodes, which is equal MAX_OPS_PER_SCRIPT legacy limit
-    CheckTestForOpCodeLimit(add_op1_ntimes(MAX_OPS_PER_SCRIPT-4) + dummy_multisig, MAX_OPS_PER_SCRIPT, sigchecker);
+    CheckTestForOpCodeLimit(add_op1_ntimes(testLimit-4) + dummy_multisig, testLimit, sigchecker);
     // test with MAX_OPS_PER_SCRIPT-3+4 opcodes, which is over MAX_OPS_PER_SCRIPT legacy limit
-    CheckTestForOpCodeLimit(add_op1_ntimes(MAX_OPS_PER_SCRIPT-3) + dummy_multisig, MAX_OPS_PER_SCRIPT+1, sigchecker);
-}
-
-BOOST_AUTO_TEST_CASE(opcode_magnetic_limit_tests)
-{
-    DummySignatureCreator sigfactory(nullptr);
-    const BaseSignatureChecker& sigchecker = sigfactory.Checker();
-
-    /**
-     * Check based on OP_ADD opcode.
-     */
-    // test with MAGNETIC_MAX_OPS_PER_SCRIPT-1 opcodes, which is under MAGNETIC_MAX_OPS_PER_SCRIPT
-    CheckTestForOpCodeLimit(add_op1_ntimes(MAGNETIC_MAX_OPS_PER_SCRIPT-1), MAGNETIC_MAX_OPS_PER_SCRIPT-1, sigchecker);
-    // test with MAGNETIC_MAX_OPS_PER_SCRIPT opcodes
-    CheckTestForOpCodeLimit(add_op1_ntimes(MAGNETIC_MAX_OPS_PER_SCRIPT), MAGNETIC_MAX_OPS_PER_SCRIPT, sigchecker);
-    // test with MAGNETIC_MAX_OPS_PER_SCRIPT+1 opcodes, which is over MAGNETIC_MAX_OPS_PER_SCRIPT
-    CheckTestForOpCodeLimit(add_op1_ntimes(MAGNETIC_MAX_OPS_PER_SCRIPT+1), MAGNETIC_MAX_OPS_PER_SCRIPT+1, sigchecker);
-
-    /**
-     * Check OP_CHECKMULTISIG/OP_CHECKMULTISIGVERIFY as this
-     * explicitly checks MAX_OPS_PER_SCRIPT.
-     */
-    // Create multi-sig signatures + public keys.
-    CScript dummy_multisig (dummy_multisig_with_pubkey());
-    // test with MAGNETIC_MAX_OPS_PER_SCRIPT-5+4 opcodes, which is under MAGNETIC_MAX_OPS_PER_SCRIPT limit
-    CheckTestForOpCodeLimit(add_op1_ntimes(MAGNETIC_MAX_OPS_PER_SCRIPT-5) + dummy_multisig, MAGNETIC_MAX_OPS_PER_SCRIPT-1, sigchecker);
-    // test with MAGNETIC_MAX_OPS_PER_SCRIPT-4+4 opcodes, which is equal MAGNETIC_MAX_OPS_PER_SCRIPT limit
-    CheckTestForOpCodeLimit(add_op1_ntimes(MAGNETIC_MAX_OPS_PER_SCRIPT-4) + dummy_multisig, MAGNETIC_MAX_OPS_PER_SCRIPT, sigchecker);
-    // test with MAGNETIC_MAX_OPS_PER_SCRIPT-3+4 opcodes, which is over MAGNETIC_MAX_OPS_PER_SCRIPT limit
-    CheckTestForOpCodeLimit(add_op1_ntimes(MAGNETIC_MAX_OPS_PER_SCRIPT-3) + dummy_multisig, MAGNETIC_MAX_OPS_PER_SCRIPT+1, sigchecker);
+    CheckTestForOpCodeLimit(add_op1_ntimes(testLimit-3) + dummy_multisig, testLimit+1, sigchecker);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

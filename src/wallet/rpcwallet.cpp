@@ -23,6 +23,7 @@
 #include "validation.h"
 #include "wallet.h"
 #include "walletdb.h"
+#include "coincontrol.h"
 
 #include <univalue.h>
 
@@ -462,8 +463,9 @@ static void SendMoney(CWallet *const pwallet, const CTxDestination &address,
     CRecipient recipient = {scriptPubKey, nValue, fSubtractFeeFromAmount};
     vecSend.push_back(recipient);
 
+    CCoinControl coinControl;
     if (!pwallet->CreateTransaction(vecSend, wtxNew, reservekey, nFeeRequired,
-                                    nChangePosRet, strError)) {
+                                    nChangePosRet, strError, coinControl)) {
         if (!fSubtractFeeFromAmount && nValue + nFeeRequired > curBalance) {
             strError = strprintf("Error: This transaction requires a "
                                  "transaction fee of at least %s",
@@ -765,8 +767,12 @@ static UniValue getreceivedbyaddress(const Config &config,
 
         CValidationState state;
         if (wtx.IsCoinBase() ||
-            !ContextualCheckTransactionForCurrentBlock(config, *wtx.tx,
-                                                       state)) {
+            !ContextualCheckTransactionForCurrentBlock(
+                config,
+               *wtx.tx,
+                chainActive.Height(),
+                chainActive.Tip()->GetMedianTimePast(),
+                state)) {
             continue;
         }
 
@@ -835,14 +841,18 @@ static UniValue getreceivedbyaccount(const Config &config,
         const CWalletTx &wtx = pairWtx.second;
         CValidationState state;
         if (wtx.IsCoinBase() ||
-            !ContextualCheckTransactionForCurrentBlock(config, *wtx.tx,
-                                                       state)) {
+            !ContextualCheckTransactionForCurrentBlock(
+                config,
+               *wtx.tx,
+                chainActive.Height(),
+                chainActive.Tip()->GetMedianTimePast(),
+                state)) {
             continue;
         }
 
         for (const CTxOut &txout : wtx.tx->vout) {
             CTxDestination address;
-            if (ExtractDestination(txout.scriptPubKey, address) &&
+            if (CWallet::ExtractDestination(txout.scriptPubKey, address) &&
                 IsMine(*pwallet, address) && setAddress.count(address)) {
                 if (wtx.GetDepthInMainChain() >= nMinDepth) {
                     nAmount += txout.nValue;
@@ -1287,8 +1297,9 @@ static UniValue sendmany(const Config &config, const JSONRPCRequest &request) {
     Amount nFeeRequired(0);
     int nChangePosRet = -1;
     std::string strFailReason;
+    CCoinControl coinControl;
     bool fCreated = pwallet->CreateTransaction(
-        vecSend, wtx, keyChange, nFeeRequired, nChangePosRet, strFailReason);
+        vecSend, wtx, keyChange, nFeeRequired, nChangePosRet, strFailReason, coinControl);
     if (!fCreated) {
         throw JSONRPCError(RPC_WALLET_INSUFFICIENT_FUNDS, strFailReason);
     }
@@ -1377,8 +1388,14 @@ struct tallyitem {
     }
 };
 
-static UniValue ListReceived(const Config &config, CWallet *const pwallet,
-                             const UniValue &params, bool fByAccounts) {
+static UniValue ListReceived(
+    const Config &config,
+    CWallet *const pwallet,
+    const UniValue &params,
+    bool fByAccounts,
+    int nChainActiveHeight,
+    int nMedianTimePast) {
+
     // Minimum confirmations
     int nMinDepth = 1;
     if (params.size() > 0) {
@@ -1403,8 +1420,12 @@ static UniValue ListReceived(const Config &config, CWallet *const pwallet,
 
         CValidationState state;
         if (wtx.IsCoinBase() ||
-            !ContextualCheckTransactionForCurrentBlock(config, *wtx.tx,
-                                                       state)) {
+            !ContextualCheckTransactionForCurrentBlock(
+                config,
+               *wtx.tx,
+                nChainActiveHeight,
+                nMedianTimePast,
+                state)) {
             continue;
         }
 
@@ -1415,7 +1436,7 @@ static UniValue ListReceived(const Config &config, CWallet *const pwallet,
 
         for (const CTxOut &txout : wtx.tx->vout) {
             CTxDestination address;
-            if (!ExtractDestination(txout.scriptPubKey, address)) {
+            if (!CWallet::ExtractDestination(txout.scriptPubKey, address)) {
                 continue;
             }
 
@@ -1559,7 +1580,13 @@ static UniValue listreceivedbyaddress(const Config &config,
     }
 
     LOCK2(cs_main, pwallet->cs_wallet);
-    return ListReceived(config, pwallet, request.params, false);
+    return ListReceived(
+                config,
+                pwallet,
+                request.params,
+                false,
+                chainActive.Height(),
+                chainActive.Tip()->GetMedianTimePast());
 }
 
 static UniValue listreceivedbyaccount(const Config &config,
@@ -1606,7 +1633,13 @@ static UniValue listreceivedbyaccount(const Config &config,
 
     LOCK2(cs_main, pwallet->cs_wallet);
 
-    return ListReceived(config, pwallet, request.params, true);
+    return ListReceived(
+                config,
+                pwallet,
+                request.params,
+                true,
+                chainActive.Height(),
+                chainActive.Tip()->GetMedianTimePast());
 }
 
 static void MaybePushAddress(UniValue &entry, const CTxDestination &dest) {
@@ -3161,7 +3194,7 @@ static UniValue listunspent(const Config &config,
 
         CTxDestination address;
         const CScript &scriptPubKey = out.tx->tx->vout[out.i].scriptPubKey;
-        bool fValidAddress = ExtractDestination(scriptPubKey, address);
+        bool fValidAddress = CWallet::ExtractDestination(scriptPubKey, address);
 
         if (destinations.size() &&
             (!fValidAddress || !destinations.count(address))) {

@@ -1,7 +1,7 @@
 // Copyright (c) 2009-2010 Satoshi Nakamoto
 // Copyright (c) 2009-2016 The Bitcoin Core developers
-// Distributed under the MIT software license, see the accompanying
-// file COPYING or http://www.opensource.org/licenses/mit-license.php.
+// Copyright (c) 2019 Bitcoin Association
+// Distributed under the Open BSV software license, see the accompanying file LICENSE.
 
 #if defined(HAVE_CONFIG_H)
 #include "config/bitcoin-config.h"
@@ -17,11 +17,13 @@
 #include "compat/sanity.h"
 #include "config.h"
 #include "consensus/validation.h"
+#include "consensus/consensus.h"
 #include "fs.h"
 #include "httprpc.h"
 #include "httpserver.h"
 #include "key.h"
-#include "miner.h"
+#include "mining/journal_builder.h"
+#include "mining/legacy.h"
 #include "net.h"
 #include "net_processing.h"
 #include "netbase.h"
@@ -32,15 +34,20 @@
 #include "script/scriptcache.h"
 #include "script/sigcache.h"
 #include "script/standard.h"
+#include "taskcancellation.h"
 #include "timedata.h"
 #include "torcontrol.h"
 #include "txdb.h"
 #include "txmempool.h"
+#include "txn_validation_config.h"
+#include "txn_validator.h"
 #include "ui_interface.h"
 #include "util.h"
 #include "utilmoneystr.h"
 #include "validation.h"
 #include "validationinterface.h"
+#include "vmtouch.h"
+
 #ifdef ENABLE_WALLET
 #include "wallet/rpcdump.h"
 #include "wallet/wallet.h"
@@ -50,11 +57,14 @@
 #include <cstdint>
 #include <cstdio>
 #include <memory>
+#include <cinttypes>
+#include <chrono>
 
 #ifndef WIN32
 #include <signal.h>
 #endif
 
+#include <boost/algorithm/string.hpp>
 #include <boost/algorithm/string/classification.hpp>
 #include <boost/algorithm/string/predicate.hpp>
 #include <boost/algorithm/string/replace.hpp>
@@ -67,7 +77,6 @@
 #include "zmq/zmqnotificationinterface.h"
 #endif
 
-bool fFeeEstimatesInitialized = false;
 static const bool DEFAULT_PROXYRANDOMIZE = true;
 static const bool DEFAULT_REST_ENABLE = false;
 static const bool DEFAULT_DISABLE_SAFEMODE = false;
@@ -96,7 +105,6 @@ enum BindFlags {
     BF_WHITELIST = (1U << 2),
 };
 
-static const char *FEE_ESTIMATES_FILENAME = "fee_estimates.dat";
 
 //////////////////////////////////////////////////////////////////////////////
 //
@@ -121,14 +129,15 @@ static const char *FEE_ESTIMATES_FILENAME = "fee_estimates.dat";
 // the parent exits from main().
 //
 
-std::atomic<bool> fRequestShutdown(false);
+std::shared_ptr<task::CCancellationSource> shutdownSource(task::CCancellationSource::Make());
 std::atomic<bool> fDumpMempoolLater(false);
 
 void StartShutdown() {
-    fRequestShutdown = true;
+    shutdownSource->Cancel();
 }
-bool ShutdownRequested() {
-    return fRequestShutdown;
+task::CCancellationToken GetShutdownToken()
+{
+    return shutdownSource->GetToken();
 }
 
 /**
@@ -198,25 +207,25 @@ void Shutdown() {
     MapPort(false);
     UnregisterValidationInterface(peerLogic.get());
     peerLogic.reset();
-    g_connman.reset();
+
+    mining::g_miningFactory.reset();
+
+    ShutdownScriptCheckQueues();
+
+    if (g_connman) {
+        // call Stop first as CConnman members are using g_connman global
+        // variable and they must be shut down before the variable is reset to
+        // nullptr (which happens before the destructor is called making Stop
+        // call inside CConnman destructor too late)
+        g_connman->Stop();
+        g_connman.reset();
+    }
 
     StopTorControl();
     UnregisterNodeSignals(GetNodeSignals());
     if (fDumpMempoolLater &&
         gArgs.GetArg("-persistmempool", DEFAULT_PERSIST_MEMPOOL)) {
         DumpMempool();
-    }
-
-    if (fFeeEstimatesInitialized) {
-        fs::path est_path = GetDataDir() / FEE_ESTIMATES_FILENAME;
-        CAutoFile est_fileout(fsbridge::fopen(est_path, "wb"), SER_DISK,
-                              CLIENT_VERSION);
-        if (!est_fileout.IsNull())
-            mempool.WriteFeeEstimates(est_fileout);
-        else
-            LogPrintf("%s: Failed to write fee estimates to %s\n", __func__,
-                      est_path.string());
-        fFeeEstimatesInitialized = false;
     }
 
     {
@@ -270,7 +279,7 @@ void Shutdown() {
  * Signal handlers are very limited in what they are allowed to do, so:
  */
 void HandleSIGTERM(int) {
-    fRequestShutdown = true;
+    StartShutdown();
 }
 
 void HandleSIGHUP(int) {
@@ -376,12 +385,14 @@ std::string HelpMessage(HelpMessageMode mode) {
     }
 
     strUsage += HelpMessageOpt(
+        "-genesisactivationheight",
+        strprintf("Set block height at which genesis should be activated. "
+                  "(default: %u).",
+                  defaultChainParams->GetConsensus().genesisHeight));
+
+    strUsage += HelpMessageOpt(
         "-loadblock=<file>",
         _("Imports blocks from external blk000??.dat file on startup"));
-    strUsage += HelpMessageOpt(
-        "-maxorphantx=<n>", strprintf(_("Keep at most <n> unconnectable "
-                                        "transactions in memory (default: %u)"),
-                                      DEFAULT_MAX_ORPHAN_TRANSACTIONS));
     strUsage += HelpMessageOpt("-maxmempool=<n>",
                                strprintf(_("Keep the transaction memory pool "
                                            "below <n> megabytes (default: %u)"),
@@ -391,6 +402,22 @@ std::string HelpMessage(HelpMessageMode mode) {
                        strprintf(_("Do not keep transactions in the mempool "
                                    "longer than <n> hours (default: %u)"),
                                  DEFAULT_MEMPOOL_EXPIRY));
+    strUsage += HelpMessageOpt("-maxmempoolnonfinal=<n>",
+                               strprintf(_("Keep the non-final transaction memory pool "
+                                           "below <n> megabytes (default: %u)"),
+                                         DEFAULT_MAX_NONFINAL_MEMPOOL_SIZE));
+    strUsage +=
+        HelpMessageOpt("-mempoolexpirynonfinal=<n>",
+                       strprintf(_("Do not keep transactions in the non-final mempool "
+                                   "longer than <n> hours (default: %u)"),
+                                 DEFAULT_NONFINAL_MEMPOOL_EXPIRY));
+
+    if (showDebug) {
+        strUsage += HelpMessageOpt("-checknonfinalfreq=<n>",
+                       strprintf(_("Run checks on non-final transactions every <n> "
+                                   "milli-seconds (default: %u)"),
+                                 CTimeLockedMempool::DEFAULT_NONFINAL_CHECKS_FREQ));
+    }
     if (showDebug) {
         strUsage += HelpMessageOpt(
             "-minimumchainwork=<hex>",
@@ -406,21 +433,49 @@ std::string HelpMessage(HelpMessageMode mode) {
                                    "and load on restart (default: %u)"),
                                  DEFAULT_PERSIST_MEMPOOL));
     strUsage += HelpMessageOpt(
-        "-blockreconstructionextratxn=<n>",
-        strprintf(_("Extra transactions to keep in memory for compact block "
-                    "reconstructions (default: %u)"),
-                  DEFAULT_BLOCK_RECONSTRUCTION_EXTRA_TXN));
-    strUsage += HelpMessageOpt(
-        "-par=<n>",
-        strprintf(_("Set the number of script verification threads (%u to %d, "
-                    "0 = auto, <0 = leave that many cores free, default: %d)"),
-                  -GetNumCores(), MAX_SCRIPTCHECK_THREADS,
+        "-threadsperblock=<n>",
+        strprintf(_("Set the number of script verification threads used when "
+                    "validating single block (0 to %d, 0 = auto, default: %d)"),
+                  MAX_SCRIPTCHECK_THREADS,
                   DEFAULT_SCRIPTCHECK_THREADS));
+    strUsage +=
+        HelpMessageOpt(
+            "-scriptvalidatormaxbatchsize=<n>",
+            strprintf(
+                _("Set size of script verification batch per thread (1 to %d, "
+                  "default: %d)"),
+                std::numeric_limits<uint8_t>::max(),
+                DEFAULT_SCRIPT_CHECK_MAX_BATCH_SIZE));
+
+    strUsage +=
+        HelpMessageOpt(
+        "-maxparallelblocks=<n>",
+        strprintf(_("Set the number of block that can be validated in parallel"
+                    " across all nodes. If additional block arrive, validation"
+                    " of an old block is terminated. (1 to 100, default: %d)"),
+                  DEFAULT_SCRIPT_CHECK_POOL_SIZE));
+    strUsage +=
+        HelpMessageOpt(
+            "-maxparallelblocksperpeer=<n>",
+            strprintf(
+                _("Set the number of blocks that can be validated in parallel "
+                  "from a single peer. If peers sends another block, the validation"
+                  " of it is delayed. (1 to maxparallelblocks, default: %d)"),
+                DEFAULT_NODE_ASYNC_TASKS_LIMIT));
+
 #ifndef WIN32
     strUsage += HelpMessageOpt(
         "-pid=<file>",
         strprintf(_("Specify pid file (default: %s)"), BITCOIN_PID_FILENAME));
 #endif
+
+    strUsage += HelpMessageOpt(
+        "-preload=<n>",
+            _("If n is set to 1, blockchain state will be preloaded into memory. If n is 0, no preload will happen. "
+              "Other values for n are not allowed. The default value is 0."
+              " This option is not supported on Windows operating systems.")
+            );
+
     strUsage += HelpMessageOpt(
         "-prune=<n>",
         strprintf(
@@ -441,6 +496,9 @@ std::string HelpMessage(HelpMessageMode mode) {
     strUsage +=
         HelpMessageOpt("-reindex", _("Rebuild chain state and block index from "
                                      "the blk*.dat files on disk"));
+    strUsage +=
+        HelpMessageOpt("-rejectmempoolrequest", _("Reject every mempool request from "
+                                     "non-whitelisted peers."));
 #ifndef WIN32
     strUsage += HelpMessageOpt(
         "-sysperms",
@@ -451,14 +509,14 @@ std::string HelpMessage(HelpMessageMode mode) {
         "-txindex", strprintf(_("Maintain a full transaction index, used by "
                                 "the getrawtransaction rpc call (default: %d)"),
                               DEFAULT_TXINDEX));
-    strUsage += HelpMessageOpt(
-        "-usecashaddr", _("Use Cash Address for destination encoding instead "
-                          "of base58 (activate by default on Jan, 14)"));
-
     strUsage += HelpMessageGroup(_("Connection options:"));
     strUsage += HelpMessageOpt(
         "-addnode=<ip>",
         _("Add a node to connect to and attempt to keep the connection open"));
+    if (showDebug) {
+        strUsage += HelpMessageOpt("-allowunsolicitedaddr",
+            _("Allow inbound peers to send us unsolicted addr messages"));
+    }
     strUsage += HelpMessageOpt(
         "-banscore=<n>",
         strprintf(
@@ -471,6 +529,18 @@ std::string HelpMessage(HelpMessageMode mode) {
     strUsage += HelpMessageOpt("-bind=<addr>",
                                _("Bind to given address and always listen on "
                                  "it. Use [host]:port notation for IPv6"));
+    strUsage += HelpMessageOpt("-blockstallingmindownloadspeed=<n>",
+        strprintf(_("Minimum average download speed (Kbytes/s) we will allow a stalling "
+                    "peer to fall to during IBD. A value of 0 means stall detection is "
+                    "disabled (default: %uKb/s)"), DEFAULT_MIN_BLOCK_STALLING_RATE));
+    if (showDebug) {
+        strUsage += HelpMessageOpt("-blockstallingtimeout=<n>",
+            strprintf(_("Number of seconds to wait before considering a peer stalling "
+                        "during IBD (default: %u)"), DEFAULT_BLOCK_STALLING_TIMEOUT));
+        strUsage += HelpMessageOpt("-blockdownloadwindow=<n>",
+            strprintf(_("Size of block download window before considering we may be stalling "
+                        "during IBD (default: %u)"), DEFAULT_BLOCK_DOWNLOAD_WINDOW));
+    }
     strUsage +=
         HelpMessageOpt("-connect=<ip>",
                        _("Connect only to the specified node(s); -noconnect or "
@@ -513,11 +583,23 @@ std::string HelpMessage(HelpMessageMode mode) {
                                           "<n>*1000 bytes (default: %u)"),
                                         DEFAULT_MAXSENDBUFFER));
     strUsage += HelpMessageOpt(
+        "-factormaxsendqueuesbytes=<n>",
+        strprintf(_("Factor that will be multiplied with excessiveBlockSize"
+            " to limit the maximum bytes in all sending queues. If this"
+            " size is exceeded, no response to block related P2P messages is sent."
+            " (default factor: %u)"),
+            DEFAULT_FACTOR_MAX_SEND_QUEUES_BYTES));
+    strUsage += HelpMessageOpt(
         "-maxtimeadjustment",
         strprintf(_("Maximum allowed median peer time offset adjustment. Local "
                     "perspective of time may be influenced by peers forward or "
                     "backward by this amount. (default: %u seconds)"),
                   DEFAULT_MAX_TIME_ADJUSTMENT));
+    strUsage += HelpMessageOpt(
+        "-broadcastdelay=<n>",
+        strprintf(
+            _("Set inventory broadcast delay duration in millisecond(min: %d, max: %d)"),
+            0,MAX_INV_BROADCAST_DELAY));
     strUsage +=
         HelpMessageOpt("-onion=<ip:port>",
                        strprintf(_("Use separate SOCKS5 proxy to reach peers "
@@ -530,6 +612,12 @@ std::string HelpMessage(HelpMessageMode mode) {
         HelpMessageOpt("-permitbaremultisig",
                        strprintf(_("Relay non-P2SH multisig (default: %d)"),
                                  DEFAULT_PERMIT_BAREMULTISIG));
+    if(showDebug) {
+        strUsage += HelpMessageOpt("-p2ptimeout=<n>",
+            strprintf(_("Number of seconds before timing out some operations "
+                "within the P2P layer. Affected operations include pings and "
+                "send/receive inactivity (default: %u seconds)"), DEFAULT_P2P_TIMEOUT_INTERVAL));
+    }
     strUsage += HelpMessageOpt(
         "-peerbloomfilters",
         strprintf(_("Support filtering of blocks and transaction with bloom "
@@ -678,7 +766,7 @@ std::string HelpMessage(HelpMessageMode mode) {
             HelpMessageOpt("-limitancestorsize=<n>",
                            strprintf("Do not accept transactions whose size "
                                      "with all in-mempool ancestors exceeds "
-                                     "<n> kilobytes (default: %u)",
+                                     "<n>*1000 bytes (default: %u)",
                                      DEFAULT_ANCESTOR_SIZE_LIMIT));
         strUsage += HelpMessageOpt(
             "-limitdescendantcount=<n>",
@@ -688,12 +776,9 @@ std::string HelpMessage(HelpMessageMode mode) {
         strUsage += HelpMessageOpt(
             "-limitdescendantsize=<n>",
             strprintf("Do not accept transactions if any ancestor would have "
-                      "more than <n> kilobytes of in-mempool descendants "
+                      "more than <n>*1000 bytes of in-mempool descendants "
                       "(default: %u).",
                       DEFAULT_DESCENDANT_SIZE_LIMIT));
-        strUsage += HelpMessageOpt("-bip9params=deployment:start:end",
-                                   "Use given start/end times for specified "
-                                   "BIP9 deployment (regtest-only)");
     }
     strUsage += HelpMessageOpt(
         "-debug=<category>",
@@ -716,6 +801,10 @@ std::string HelpMessage(HelpMessageMode mode) {
         "-help-debug",
         _("Show all debugging options (usage: --help -help-debug)"));
     strUsage += HelpMessageOpt(
+        "-debugp2pthreadstalls",
+        _("Log P2P requests that stall request processing loop for longer than "
+          "specified milliseconds (default: disabled)"));
+    strUsage += HelpMessageOpt(
         "-logips",
         strprintf(_("Include IP addresses in debug output (default: %d)"),
                   DEFAULT_LOGIPS));
@@ -733,6 +822,9 @@ std::string HelpMessage(HelpMessageMode mode) {
             "-mocktime=<n>",
             "Replace actual time with <n> seconds since epoch (default: 0)");
         strUsage += HelpMessageOpt(
+            "-blocksizeactivationtime=<n>",
+            "Change time that specifies when new defaults for -blockmaxsize are used");
+        strUsage += HelpMessageOpt(
             "-limitfreerelay=<n>",
             strprintf("Continuously rate-limit free transactions to <n>*1000 "
                       "bytes per minute (default: %u)",
@@ -747,6 +839,10 @@ std::string HelpMessage(HelpMessageMode mode) {
             strprintf("Limit size of signature cache to <n> MiB (default: %u)",
                       DEFAULT_MAX_SIG_CACHE_SIZE));
         strUsage += HelpMessageOpt(
+            "-maxinvalidsigcachesize=<n>",
+            strprintf("Limit size of invalid signature cache to <n> MiB (default: %u)",
+                      DEFAULT_INVALID_MAX_SIG_CACHE_SIZE));
+        strUsage += HelpMessageOpt(
             "-maxscriptcachesize=<n>",
             strprintf("Limit size of script cache to <n> MiB (default: %u)",
                       DEFAULT_MAX_SCRIPT_CACHE_SIZE));
@@ -756,11 +852,6 @@ std::string HelpMessage(HelpMessageMode mode) {
                       "block download (default: %u)",
                       DEFAULT_MAX_TIP_AGE));
     }
-    strUsage += HelpMessageOpt(
-        "-excessutxocharge=<amt>",
-        strprintf(_("Fees (in %s/kB) to charge per utxo created for"
-                    "relaying, and mining (default: %s)"),
-                  CURRENCY_UNIT, FormatMoney(DEFAULT_UTXO_FEE)));
     strUsage += HelpMessageOpt(
         "-minrelaytxfee=<amt>",
         strprintf(
@@ -775,7 +866,7 @@ std::string HelpMessage(HelpMessageMode mode) {
                   CURRENCY_UNIT, FormatMoney(DEFAULT_TRANSACTION_MAXFEE)));
     strUsage += HelpMessageOpt(
         "-printtoconsole",
-        _("Send trace/debug info to console instead of debug.log file"));
+        _("Send trace/debug info to console instead of bitcoind.log file"));
     if (showDebug) {
         strUsage += HelpMessageOpt(
             "-printpriority", strprintf("Log transaction priority and fee per "
@@ -783,7 +874,7 @@ std::string HelpMessage(HelpMessageMode mode) {
                                         DEFAULT_PRINTPRIORITY));
     }
     strUsage += HelpMessageOpt("-shrinkdebugfile",
-                               _("Shrink debug.log file on client startup "
+                               _("Shrink bitcoind.log file on client startup "
                                  "(default: 1 when no -debug)"));
 
     AppendParamsHelpMessages(strUsage, showDebug);
@@ -793,8 +884,7 @@ std::string HelpMessage(HelpMessageMode mode) {
         HelpMessageOpt("-excessiveblocksize=<n>",
                        strprintf(_("Set the maximum block size in bytes we will accept "
                                    "from any source. This is the effective block size "
-                                   "hard limit (default: %d)"),
-                                 DEFAULT_MAX_BLOCK_SIZE));
+                                   "hard limit and it is a required parameter (0 = unlimited).")));
     if (showDebug) {
         strUsage += HelpMessageOpt(
             "-acceptnonstdtxn",
@@ -803,17 +893,18 @@ std::string HelpMessage(HelpMessageMode mode) {
                 "testnet/regtest only; ",
                 defaultChainParams->RequireStandard()));
         strUsage += HelpMessageOpt(
+            "-acceptnonstdoutputs",
+            strprintf(
+                "Relay and mine transactions that create or consume non standard"
+                " outputs after Genesis is activated. (default: %u)",
+                GlobalConfig::GetConfig().GetAcceptNonStandardOutput(true)));
+        strUsage += HelpMessageOpt(
             "-dustrelayfee=<amt>",
             strprintf("Fee rate (in %s/kB) used to defined dust, the value of "
                       "an output such that it will cost about 1/3 of its value "
                       "in fees at this fee rate to spend it. (default: %s)",
                       CURRENCY_UNIT, FormatMoney(DUST_RELAY_TX_FEE)));
     }
-    strUsage +=
-        HelpMessageOpt("-bytespersigop",
-                       strprintf(_("Equivalent bytes per sigop in transactions "
-                                   "for relay and mining (default: %u)"),
-                                 DEFAULT_BYTES_PER_SIGOP));
     strUsage += HelpMessageOpt(
         "-datacarrier",
         strprintf(_("Relay and mine data carrier transactions (default: %d)"),
@@ -822,15 +913,78 @@ std::string HelpMessage(HelpMessageMode mode) {
         "-datacarriersize",
         strprintf(_("Maximum size of data in data carrier transactions we "
                     "relay and mine (default: %u)"),
-                  MAX_OP_RETURN_RELAY));
+                  DEFAULT_DATA_CARRIER_SIZE));
+    strUsage += HelpMessageOpt(
+        "-maxstackmemoryusageconsensus",
+        strprintf(_("Set maximum stack memory usage in bytes used for script verification "
+                    "we're willing to accept from any source (0 = unlimited) "
+                    "after Genesis is activated (consensus level). This is a required parameter.")));
+    strUsage += HelpMessageOpt(
+        "-maxstackmemoryusagepolicy",
+        strprintf(_("Set maximum stack memory usage used for script verification "
+                    "we're willing to relay/mine in a single transaction "
+                    "(default: %u bytes, 0 = unlimited) "
+                    "after Genesis is activated (policy level). "
+                    "Must be less or equal to -maxstackmemoryusageconsensus."),
+                  DEFAULT_STACK_MEMORY_USAGE_POLICY_AFTER_GENESIS));
+    strUsage +=
+        HelpMessageOpt("-maxopsperscriptpolicy=<n>",
+            strprintf(_("Set maximum number of non-push operations "
+                        "we're willing to relay/mine per script (default: unlimited, 0 = unlimited), after Genesis is activated")));
+    strUsage += HelpMessageOpt(
+        "-maxtxsigopscountspolicy=<n>",
+        strprintf("Set maximum allowed number of signature operations we're willing to relay/mine in a single transaction (default: unlimited, 0 = unlimited) after Genesis is activated."));
+
+
+    strUsage += HelpMessageOpt(
+        "-maxstdtxvalidationduration=<n>",
+        strprintf(
+            _("Set the single standard transaction validation duration threshold in"
+              " milliseconds after which the standard transaction validation will"
+              " terminate with error and the transaction is not accepted to"
+              " mempool (min 5ms, default: %dms)"),
+            DEFAULT_MAX_STD_TXN_VALIDATION_DURATION.count()));
+
+    strUsage += HelpMessageOpt(
+        "-maxnonstdtxvalidationduration=<n>",
+        strprintf(
+            _("Set the single non-standard transaction validation duration threshold in"
+              " milliseconds after which the non-standard transaction validation will"
+              " terminate with error and the transaction is not accepted to"
+              " mempool (min 10ms, default: %dms)"),
+            DEFAULT_MAX_NON_STD_TXN_VALIDATION_DURATION.count()));
+
+    strUsage +=
+        HelpMessageOpt("-maxtxsizepolicy=<n>",
+            strprintf(_("Set maximum transaction size in bytes we relay and mine (default: %u, min: %u, 0 = unlimited) after Genesis is activated"),
+                DEFAULT_MAX_TX_SIZE_POLICY_AFTER_GENESIS, MAX_TX_SIZE_POLICY_BEFORE_GENESIS));
+
+    strUsage += HelpMessageOpt(
+        "-maxscriptsizepolicy",
+        strprintf("Set maximum script size in bytes we're willing to relay/mine per script after Genesis is activated. "
+            "(default: %u, 0 = unlimited).",
+            DEFAULT_MAX_SCRIPT_SIZE_POLICY_AFTER_GENESIS));
+
+    strUsage += HelpMessageOpt(
+        "-maxscriptnumlengthpolicy=<n>",
+        strprintf("Set maximum allowed number length we're willing to relay/mine in scripts (default: %d, 0 = unlimited) after Genesis is activated.",
+            DEFAULT_SCRIPT_NUM_LENGTH_POLICY_AFTER_GENESIS));
 
     strUsage += HelpMessageGroup(_("Block creation options:"));
     strUsage += HelpMessageOpt(
         "-blockmaxsize=<n>",
-        strprintf(_("Set maximum block size in bytes we will mine (default: %d). "
-                    "Must be less than or equal the hard maximum block size limit "
-                    "as set by -excessiveblocksize"),
-                  DEFAULT_MAX_GENERATED_BLOCK_SIZE));
+        strprintf(_("Set maximum block size in bytes we will mine. "
+                    "Size of the mined block will never exceed the maximum block size we will accept (-excessiveblocksize). "
+                    "If not specified, the following defaults are used: "
+                    "Mainnet: %d before %s and %d after, "
+                    "Testnet: %d before %s and %d after."),
+                    defaultChainParams->GetDefaultBlockSizeParams().maxGeneratedBlockSizeBefore,
+                    DateTimeStrFormat("%Y-%m-%d %H:%M:%S", defaultChainParams->GetDefaultBlockSizeParams().blockSizeActivationTime),
+                    defaultChainParams->GetDefaultBlockSizeParams().maxGeneratedBlockSizeAfter,
+                    testnetChainParams->GetDefaultBlockSizeParams().maxGeneratedBlockSizeBefore,
+                    DateTimeStrFormat("%Y-%m-%d %H:%M:%S", testnetChainParams->GetDefaultBlockSizeParams().blockSizeActivationTime),
+                    testnetChainParams->GetDefaultBlockSizeParams().maxGeneratedBlockSizeAfter
+                    ));
     strUsage += HelpMessageOpt(
         "-blockprioritypercentage=<n>",
         strprintf(_("Set maximum percentage of a block reserved to "
@@ -841,11 +995,34 @@ std::string HelpMessage(HelpMessageMode mode) {
         strprintf(_("Set lowest fee rate (in %s/kB) for transactions to be "
                     "included in block creation. (default: %s)"),
                   CURRENCY_UNIT, FormatMoney(DEFAULT_BLOCK_MIN_TX_FEE)));
+    strUsage += HelpMessageOpt(
+        "-invalidateblock=<hash>",
+        strprintf(_("Permanently marks an existing block as invalid as if it violated "
+                    "a consensus rule (same as InvalidateBlock RPC function). "
+                    "If specified block header was not received yet, the header will be "
+                    "ignored when it is received from a peer. "
+                    "This option can be specified multiple times.")));
+
+    strUsage += HelpMessageOpt(
+        "-banclientua=<ua>",
+        strprintf(_("Ban clients whose User Agent contains specified string (case insensitive). "
+                    "This option can be specified multiple times.")));
+
     if (showDebug) {
         strUsage +=
             HelpMessageOpt("-blockversion=<n>",
                            "Override block version to test forking scenarios");
+        strUsage +=
+            HelpMessageOpt("-blockcandidatevaliditytest",
+                           strprintf(_("Perform validity test on block candidates. Defaults: "
+                           "Mainnet: %d, Testnet: %d"), defaultChainParams->TestBlockCandidateValidity(), testnetChainParams->TestBlockCandidateValidity()));
     }
+
+    strUsage += HelpMessageOpt(
+        "-blockassembler=<type>",
+        strprintf(_("Set the type of block assembler to use for mining. Supported options are "
+                    "LEGACY or JOURNALING. (default: %s)"),
+                  enum_cast<std::string>(mining::DEFAULT_BLOCK_ASSEMBLER_TYPE).c_str()));
 
     strUsage += HelpMessageGroup(_("RPC server options:"));
     strUsage += HelpMessageOpt("-server",
@@ -885,6 +1062,11 @@ std::string HelpMessage(HelpMessageMode mode) {
           "1.2.3.4/255.255.255.0) or a network/CIDR (e.g. 1.2.3.4/24). This "
           "option can be specified multiple times"));
     strUsage += HelpMessageOpt(
+        "-magicbytes=<hexcode>",
+        _("Allow users to split the test net by changing the magicbytes. "
+          "This option only work on a network different than mainnet. "
+          "default : 0f0f0f0f"));
+    strUsage += HelpMessageOpt(
         "-rpcthreads=<n>",
         strprintf(
             _("Set the number of threads to service RPC calls (default: %d)"),
@@ -902,6 +1084,79 @@ std::string HelpMessage(HelpMessageMode mode) {
             strprintf("Timeout during HTTP requests (default: %d)",
                       DEFAULT_HTTP_SERVER_TIMEOUT));
     }
+     strUsage += HelpMessageOpt(
+        "-invalidcsinterval=<n>",
+         strprintf("Set the time limit on the reception of invalid message checksums from a single node in milliseconds (default: %dms)",
+            DEFAULT_MIN_TIME_INTERVAL_CHECKSUM_MS)) ;
+
+         strUsage += HelpMessageOpt(
+        "-invalidcsfreq=<n>",
+         strprintf("Set the limit on the number of invalid checksums received over a given time period from a single node  (default: %d)",
+            DEFAULT_INVALID_CHECKSUM_FREQUENCY)) ;
+
+    /** COrphanTxns */
+    strUsage += HelpMessageGroup(_("Orphan txns config :"));
+    strUsage += HelpMessageOpt(
+        "-blockreconstructionextratxn=<n>",
+        strprintf(_("Extra transactions to keep in memory for compact block "
+                    "reconstructions (default: %u)"),
+            COrphanTxns::DEFAULT_BLOCK_RECONSTRUCTION_EXTRA_TXN));
+    strUsage += HelpMessageOpt(
+        "-maxorphantxsize=<n>",
+        strprintf(_("Keep at most <n> MB of unconnectable "
+                    "transactions in memory (default: %u MB)"),
+          COrphanTxns::DEFAULT_MAX_ORPHAN_TRANSACTIONS_SIZE/ONE_MEGABYTE));
+    strUsage += HelpMessageOpt(
+        "-maxcollectedoutpoints=<n>",
+        strprintf(_("Keep at most <n> collected "
+                    "outpoints in memory (default: %u)"),
+            COrphanTxns::DEFAULT_MAX_COLLECTED_OUTPOINTS));
+
+    /** TxnValidator */
+    strUsage += HelpMessageGroup(_("TxnValidator options:"));
+    strUsage += HelpMessageOpt(
+        "-numstdtxvalidationthreads=<n>",
+        strprintf(_("Set the number of 'High' priority threads used to validate standard txns (dynamically calculated default: %d)"),
+            GetNumHighPriorityValidationThrs())) ;
+    strUsage += HelpMessageOpt(
+        "-numnonstdtxvalidationthreads=<n>",
+        strprintf(_("Set the number of 'Low' priority threads used to validate non-standard txns (dynamically calculated default: %d)"),
+            GetNumLowPriorityValidationThrs())) ;
+    strUsage += HelpMessageOpt(
+        "-maxstdtxnsperthreadratio=<n>",
+        strprintf(_("Set the max ratio for a number of standard txns per 'High' priority thread (default: %d)"),
+            DEFAULT_MAX_STD_TXNS_PER_THREAD_RATIO)) ;
+    strUsage += HelpMessageOpt(
+        "-maxnonstdtxnsperthreadratio=<n>",
+        strprintf(_("Set the max ratio for a number of non-standard txns per 'Low' priority thread (default: %d)"),
+            DEFAULT_MAX_NON_STD_TXNS_PER_THREAD_RATIO)) ;
+    strUsage += HelpMessageOpt(
+        "-txnvalidationasynchrunfreq=<n>",
+        strprintf("Set run frequency in asynchronous mode (default: %dms)",
+            CTxnValidator::DEFAULT_ASYNCH_RUN_FREQUENCY_MILLIS)) ;
+    strUsage += HelpMessageOpt(
+        "-maxtxnvalidatorasynctasksrunduration=<n>",
+        strprintf("Set the maximum validation duration for async tasks in a single run (default: %dms)",
+            CTxnValidator::DEFAULT_MAX_ASYNC_TASKS_RUN_DURATION.count())) ;
+    strUsage += HelpMessageOpt(
+        "-maxcoinsviewcachesize=<n>",
+        _("Set the maximum cumulative size of accepted transaction inputs inside coins cache (default: unlimited -> 0)"));
+    strUsage += HelpMessageOpt(
+        "-txnvalidationqueuesmaxmemory=<n>",
+        strprintf("Set the maximum memory usage for the transaction queues in MB (default: %d)",
+            CTxnValidator::DEFAULT_MAX_MEMORY_TRANSACTION_QUEUES)) ;
+
+    strUsage += HelpMessageOpt(
+        "-maxpubkeyspermultisigpolicy=<n>",
+        strprintf("Set maximum allowed number of public keys we're willing to relay/mine in a single CHECK_MULTISIG(VERIFY) operation (default: unlimited, 0 = unlimited), after Genesis is activated"));
+
+    strUsage += HelpMessageOpt(
+        "-maxgenesisgracefulperiod=<n>",
+        strprintf(_("Set maximum allowed number of blocks for Genesis graceful period (default: %d) where nodes will not be banned "
+                    "for violating Genesis rules in case the calling node is not yet on Genesis height and vice versa. "
+                    "Seting 0 will disable Genesis graceful period. Genesis graceful period range :"
+                    "(GENESIS_ACTIVATION_HEIGHT - n |...| GENESIS_ACTIVATION_HEIGHT |...| GENESIS_ACTIVATION_HEIGHT + n)"),
+            DEFAULT_GENESIS_GRACEFULL_ACTIVATION_PERIOD));
 
     return strUsage;
 }
@@ -921,9 +1176,9 @@ std::string LicenseInfo() {
            "\n" + strprintf(_("The source code is available from %s."),
                             URL_SOURCE_CODE) +
            "\n" + "\n" + _("This is experimental software.") + "\n" +
-           strprintf(_("Distributed under the MIT software license, see the "
-                       "accompanying file %s or %s"),
-                     "COPYING", "<https://opensource.org/licenses/MIT>") +
+           strprintf(_("Distributed under the Open BSV software license, see the "
+                       "accompanying file %s"),
+                     "LICENSE") +
            "\n" + "\n" +
            strprintf(_("This product includes software developed by the "
                        "OpenSSL Project for use in the OpenSSL Toolkit %s and "
@@ -1012,7 +1267,10 @@ void CleanupBlockRevFiles() {
     }
 }
 
-void ThreadImport(const Config &config, std::vector<fs::path> vImportFiles) {
+/* shutdownToken must be passed by value to prevent access violation because
+ * "import_files" thread can have longer life span than shutdownToken presented with a reference.
+ */
+void ThreadImport(const Config &config, std::vector<fs::path> vImportFiles, const task::CCancellationToken shutdownToken) {
     RenameThread("bitcoin-loadblk");
 
     {
@@ -1020,29 +1278,7 @@ void ThreadImport(const Config &config, std::vector<fs::path> vImportFiles) {
 
         // -reindex
         if (fReindex) {
-            int nFile = 0;
-            while (true) {
-                CDiskBlockPos pos(nFile, 0);
-                if (!fs::exists(GetBlockPosFilename(pos, "blk"))) {
-                    // No block files left to reindex
-                    break;
-                }
-                FILE *file = OpenBlockFile(pos, true);
-                if (!file) {
-                    // This error is logged in OpenBlockFile
-                    break;
-                }
-                LogPrintf("Reindexing block file blk%05u.dat...\n",
-                          (unsigned int)nFile);
-                LoadExternalBlockFile(config, file, &pos);
-                nFile++;
-            }
-            pblocktree->WriteReindexing(false);
-            fReindex = false;
-            LogPrintf("Reindexing finished\n");
-            // To avoid ending up in a situation without genesis block, re-try
-            // initializing (no-op if reindexing worked):
-            InitBlockIndex(config);
+            ReindexAllBlockFiles(config, pblocktree, fReindex);
         }
 
         // hardcoded $DATADIR/bootstrap.dat
@@ -1074,8 +1310,13 @@ void ThreadImport(const Config &config, std::vector<fs::path> vImportFiles) {
 
         // scan for better chains in the block chain database, that are not yet
         // connected in the active best chain
-        CValidationState state;
-        if (!ActivateBestChain(config, state)) {
+
+        // dummyState is used to report errors, not block related invalidity
+        // (see description of ActivateBestChain)
+        CValidationState dummyState;
+        mining::CJournalChangeSetPtr changeSet { mempool.getJournalBuilder()->getNewChangeSet(mining::JournalUpdateReason::INIT) };
+        auto source = task::CCancellationSource::Make();
+        if (!ActivateBestChain(task::CCancellationToken::JoinToken(source->GetToken(), shutdownToken), config, dummyState, changeSet)) {
             LogPrintf("Failed to connect best block");
             StartShutdown();
         }
@@ -1087,8 +1328,8 @@ void ThreadImport(const Config &config, std::vector<fs::path> vImportFiles) {
         }
     } // End scope of CImportingNow
     if (gArgs.GetArg("-persistmempool", DEFAULT_PERSIST_MEMPOOL)) {
-        LoadMempool(config);
-        fDumpMempoolLater = !fRequestShutdown;
+        LoadMempool(config, shutdownToken);
+        fDumpMempoolLater = !shutdownToken.IsCanceled();
     }
 }
 
@@ -1304,7 +1545,7 @@ bool AppInitBasicSetup() {
     sigaction(SIGTERM, &sa, nullptr);
     sigaction(SIGINT, &sa, nullptr);
 
-    // Reopen debug.log on SIGHUP
+    // Reopen bitcoind.log on SIGHUP
     struct sigaction sa_hup;
     sa_hup.sa_handler = HandleSIGHUP;
     sigemptyset(&sa_hup.sa_mask);
@@ -1337,9 +1578,8 @@ bool AppInitParameterInteraction(Config &config) {
     // stop program execution and warn the user with a proper error message
     const int64_t blkprio = gArgs.GetArg("-blockprioritypercentage",
                                          DEFAULT_BLOCK_PRIORITY_PERCENTAGE);
-    if (!config.SetBlockPriorityPercentage(blkprio)) {
-        return InitError(_("Block priority percentage has to belong to the "
-                           "[0..100] interval."));
+    if (std::string err; !config.SetBlockPriorityPercentage(blkprio, &err)) {
+        return InitError(err);
     }
 
     // Make sure enough file descriptors are available
@@ -1435,7 +1675,7 @@ bool AppInitParameterInteraction(Config &config) {
             0),
         1000000);
     if (ratio != 0) {
-        mempool.setSanityCheck(1.0 / ratio);
+        mempool.SetSanityCheck(1.0 / ratio);
     }
     fCheckBlockIndex = gArgs.GetBoolArg("-checkblockindex",
                                         chainparams.DefaultConsistencyChecks());
@@ -1474,42 +1714,135 @@ bool AppInitParameterInteraction(Config &config) {
     // mempool limits
     int64_t nMempoolSizeMax =
         gArgs.GetArg("-maxmempool", DEFAULT_MAX_MEMPOOL_SIZE) * 1000000;
-    int64_t nMempoolSizeMin =
-        gArgs.GetArg("-limitdescendantsize", DEFAULT_DESCENDANT_SIZE_LIMIT) *
-        1000 * 40;
+    constexpr int64_t nMempoolSizeMin = DEFAULT_MAX_MEMPOOL_SIZE * ONE_MEGABYTE * 0.3;
     if (nMempoolSizeMax < 0 || nMempoolSizeMax < nMempoolSizeMin)
         return InitError(strprintf(_("-maxmempool must be at least %d MB"),
                                    std::ceil(nMempoolSizeMin / 1000000.0)));
 
-    // -par=0 means autodetect, but nScriptCheckThreads==0 means no concurrency
-    nScriptCheckThreads = gArgs.GetArg("-par", DEFAULT_SCRIPTCHECK_THREADS);
-    if (nScriptCheckThreads <= 0) nScriptCheckThreads += GetNumCores();
-    if (nScriptCheckThreads <= 1)
-        nScriptCheckThreads = 0;
-    else if (nScriptCheckThreads > MAX_SCRIPTCHECK_THREADS)
-        nScriptCheckThreads = MAX_SCRIPTCHECK_THREADS;
+
+    // script validation settings
+    if(std::string error; !config.SetBlockScriptValidatorsParams(
+        gArgs.GetArg("-maxparallelblocks", DEFAULT_SCRIPT_CHECK_POOL_SIZE),
+        gArgs.GetArg("-threadsperblock", DEFAULT_SCRIPTCHECK_THREADS),
+        gArgs.GetArg("-scriptvalidatormaxbatchsize", DEFAULT_SCRIPT_CHECK_MAX_BATCH_SIZE),
+        &error))
+    {
+        return InitError(error);
+    }
+
+    if(std::string error; !config.SetMaxConcurrentAsyncTasksPerNode(
+        gArgs.GetArg("-maxparallelblocksperpeer", DEFAULT_NODE_ASYNC_TASKS_LIMIT),
+        &error))
+    {
+        return InitError("-maxparallelblocksperpeer: " + error);
+    }
+
+    // Configure preferred size of blockfile.
+    config.SetPreferredBlockFileSize(
+        gArgs.GetArg("-preferredblockfilesize",
+            DEFAULT_PREFERRED_BLOCKFILE_SIZE));
 
     // Configure excessive block size.
     if(gArgs.IsArgSet("-excessiveblocksize")) {
         const uint64_t nProposedExcessiveBlockSize =
-            gArgs.GetArg("-excessiveblocksize", DEFAULT_MAX_BLOCK_SIZE);
-        if (!config.SetMaxBlockSize(nProposedExcessiveBlockSize)) {
-            return InitError(strprintf(_(
-                "Excessive block size must be > %d and less than the "
-                "max block file size (%d)"),
-                LEGACY_MAX_BLOCK_SIZE, MAX_BLOCKFILE_SIZE - BLOCKFILE_BLOCK_HEADER_SIZE
-            ));
+            gArgs.GetArg("-excessiveblocksize", 0);
+        if (std::string err; !config.SetMaxBlockSize(nProposedExcessiveBlockSize, &err)) {
+            return InitError(err);
         }
     }
 
-    // Check blockmaxsize does not exceed maximum accepted block size.
-    const uint64_t nProposedMaxGeneratedBlockSize =
-        gArgs.GetArg("-blockmaxsize", DEFAULT_MAX_GENERATED_BLOCK_SIZE);
-    if (nProposedMaxGeneratedBlockSize > config.GetMaxBlockSize()) {
-        auto msg = _("Max generated block size (blockmaxsize) cannot exceed "
-                     "the excessive block size (excessiveblocksize)");
-        return InitError(msg);
+    if(gArgs.IsArgSet("-factormaxsendqueuesbytes")) {
+        const uint64_t factorMaxSendQueuesBytes = gArgs.GetArg("-factormaxsendqueuesbytes", DEFAULT_FACTOR_MAX_SEND_QUEUES_BYTES);
+        config.SetFactorMaxSendQueuesBytes(factorMaxSendQueuesBytes);
     }
+
+    // Configure max generated block size.
+    if(gArgs.IsArgSet("-blockmaxsize")) {
+        const uint64_t nProposedMaxGeneratedBlockSize =
+            gArgs.GetArg("-blockmaxsize", 0 /* not used*/);
+        if (std::string err; !config.SetMaxGeneratedBlockSize(nProposedMaxGeneratedBlockSize, &err)) {
+            return InitError(err);
+        }
+    }
+
+    // Configure block size related activation time
+    if(gArgs.IsArgSet("-blocksizeactivationtime")) {
+        const int64_t nProposedActivationTime =
+            gArgs.GetArg("-blocksizeactivationtime", 0);
+        if (std::string err; !config.SetBlockSizeActivationTime(nProposedActivationTime)){
+            return InitError(err);
+        }
+    }
+
+    // Configure whether to run extra block candidate validity checks
+    config.SetTestBlockCandidateValidity(
+        gArgs.GetBoolArg("-blockcandidatevaliditytest", chainparams.TestBlockCandidateValidity()));
+
+    // Configure mining block assembler
+    if(gArgs.IsArgSet("-blockassembler")) {
+        std::string assemblerStr { boost::to_upper_copy<std::string>(gArgs.GetArg("-blockassembler", "")) };
+        mining::CMiningFactory::BlockAssemblerType assembler { enum_cast<mining::CMiningFactory::BlockAssemblerType>(assemblerStr) };
+        if(assembler == mining::CMiningFactory::BlockAssemblerType::UNKNOWN)
+            assembler = mining::DEFAULT_BLOCK_ASSEMBLER_TYPE;
+        config.SetMiningCandidateBuilder(assembler);
+    }
+
+    // Configure data carrier size.
+    if(gArgs.IsArgSet("-datacarriersize")) {
+        config.SetDataCarrierSize(gArgs.GetArg("-datacarriersize", DEFAULT_DATA_CARRIER_SIZE));
+    }
+
+    // Configure descendant limit count.
+    if(gArgs.IsArgSet("-limitdescendantcount")) {
+        config.SetLimitDescendantCount(gArgs.GetArg("-limitdescendantcount", DEFAULT_DESCENDANT_LIMIT));
+    }
+
+    // Configure ancestor limit count.
+    if(gArgs.IsArgSet("-limitancestorcount")) {
+        config.SetLimitAncestorCount(gArgs.GetArg("-limitancestorcount", DEFAULT_ANCESTOR_LIMIT));
+    }
+
+    // configure max transaction size policy
+    if (gArgs.IsArgSet("-maxtxsizepolicy"))
+    {
+        int64_t maxTxSizePolicy = gArgs.GetArg("-maxtxsizepolicy", DEFAULT_MAX_TX_SIZE_POLICY_AFTER_GENESIS);
+        if (std::string err; !config.SetMaxTxSizePolicy(maxTxSizePolicy, &err)) {
+            return InitError(err);
+        }
+    }
+
+    // Configure descendant limit size.
+    if(gArgs.IsArgSet("-limitdescendantsize")) {
+        config.SetLimitDescendantSize(gArgs.GetArg("-limitdescendantsize", DEFAULT_DESCENDANT_SIZE_LIMIT) * 1000);
+    }
+
+    // Configure ancestor limit size.
+    if(gArgs.IsArgSet("-limitancestorsize")) {
+        config.SetLimitAncestorSize(gArgs.GetArg("-limitancestorsize", DEFAULT_ANCESTOR_SIZE_LIMIT) * 1000);
+    }
+
+    // Configure genesis activation height.
+    int64_t genesisActivationHeight = gArgs.GetArg("-genesisactivationheight", chainparams.GetConsensus().genesisHeight);
+    if (std::string err; !config.SetGenesisActivationHeight(genesisActivationHeight, &err)) {
+        return InitError(err);
+    }
+
+    if (std::string err; !config.SetMaxStackMemoryUsage(
+        gArgs.GetArg("-maxstackmemoryusageconsensus", 0),
+        gArgs.GetArg("-maxstackmemoryusagepolicy", DEFAULT_STACK_MEMORY_USAGE_POLICY_AFTER_GENESIS),
+        &err))
+    {
+        return InitError(err);
+    }
+
+    //Configure max script size after genesis
+    if (gArgs.IsArgSet("-maxscriptsizepolicy")) {
+        int64_t maxScriptSize = gArgs.GetArg("-maxscriptsizepolicy", DEFAULT_MAX_SCRIPT_SIZE_POLICY_AFTER_GENESIS);
+        if (std::string err; !config.SetMaxScriptSizePolicy(maxScriptSize, &err)) {
+            return InitError(err);
+        }
+    }
+
 
     // block pruning; get the amount of disk space (in MiB) to allot for block &
     // undo files
@@ -1538,6 +1871,42 @@ bool AppInitParameterInteraction(Config &config) {
         fPruneMode = true;
     }
 
+    if(std::string err; !config.SetMaxStdTxnValidationDuration(
+        gArgs.GetArg(
+            "-maxstdtxvalidationduration",
+            DEFAULT_MAX_STD_TXN_VALIDATION_DURATION.count()),
+        &err))
+    {
+        return InitError(err);
+    }
+
+    if(std::string err; !config.SetMaxNonStdTxnValidationDuration(
+        gArgs.GetArg(
+            "-maxnonstdtxvalidationduration",
+            DEFAULT_MAX_NON_STD_TXN_VALIDATION_DURATION.count()),
+        &err))
+    {
+        return InitError(err);
+    }
+
+    if (!(config.GetMaxStdTxnValidationDuration() < config.GetMaxNonStdTxnValidationDuration())) {
+        return InitError(
+            strprintf("maxstdtxvalidationduration must be less than maxnonstdtxvalidationduration"));
+    }
+
+    if (!(gArgs.GetArg("-maxtxnvalidatorasynctasksrunduration",
+            CTxnValidator::DEFAULT_MAX_ASYNC_TASKS_RUN_DURATION.count()) >
+        config.GetMaxNonStdTxnValidationDuration().count())) {
+        return InitError(
+            strprintf("maxtxnvalidatorasynctasksrunduration must be greater than maxnonstdtxvalidationduration"));
+    }
+
+    if(std::string err; !config.SetMaxCoinsViewCacheSize(
+        gArgs.GetArg("-maxcoinsviewcachesize", 0), &err))
+    {
+        return InitError(err);
+    }
+
     RegisterAllRPCCommands(tableRPC);
 #ifdef ENABLE_WALLET
     RegisterWalletRPCCommands(tableRPC);
@@ -1546,18 +1915,6 @@ bool AppInitParameterInteraction(Config &config) {
 
     nConnectTimeout = gArgs.GetArg("-timeout", DEFAULT_CONNECT_TIMEOUT);
     if (nConnectTimeout <= 0) nConnectTimeout = DEFAULT_CONNECT_TIMEOUT;
-
-    // Obtain the amount to charge excess UTXO
-    if (gArgs.IsArgSet("-excessutxocharge")) {
-        Amount n(0);
-        auto parsed = ParseMoney(gArgs.GetArg("-excessutxocharge", ""), n);
-        if (!parsed || Amount(0) > n)
-            return InitError(AmountErrMsg(
-                "excessutxocharge", gArgs.GetArg("-excessutxocharge", "")));
-        config.SetExcessUTXOCharge(n);
-    } else {
-        config.SetExcessUTXOCharge(DEFAULT_UTXO_FEE);
-    }
 
     // Fee-per-kilobyte amount considered the same as "free". If you are mining,
     // be careful setting this: if you set it to zero then a transaction spammer
@@ -1602,7 +1959,9 @@ bool AppInitParameterInteraction(Config &config) {
         return InitError(
             strprintf("acceptnonstdtxn is not currently supported for %s chain",
                       chainparams.NetworkIDString()));
-    nBytesPerSigOp = gArgs.GetArg("-bytespersigop", nBytesPerSigOp);
+
+    config.SetAcceptNonStandardOutput(
+        gArgs.GetBoolArg("-acceptnonstdoutputs", config.GetAcceptNonStandardOutput(true)));
 
 #ifdef ENABLE_WALLET
     if (!CWallet::ParameterInteraction()) return false;
@@ -1626,48 +1985,69 @@ bool AppInitParameterInteraction(Config &config) {
 
     nMaxTipAge = gArgs.GetArg("-maxtipage", DEFAULT_MAX_TIP_AGE);
 
-    if (gArgs.IsArgSet("-bip9params")) {
-        // Allow overriding BIP9 parameters for testing
-        if (!chainparams.MineBlocksOnDemand()) {
-            return InitError(
-                "BIP9 parameters may only be overridden on regtest.");
+    // Configure the maximum number of sigops we're willing to relay/mine in a single tx
+    if (gArgs.IsArgSet("-maxtxsigopscountspolicy"))
+    {
+        const int64_t value = gArgs.GetArg("-maxtxsigopscountspolicy", DEFAULT_TX_SIGOPS_COUNT_POLICY_AFTER_GENESIS);
+        if (std::string err; !config.SetMaxTxSigOpsCountPolicy(value, &err))
+        {
+            return InitError(err);
         }
-        for (const std::string &strDeployment : gArgs.GetArgs("-bip9params")) {
-            std::vector<std::string> vDeploymentParams;
-            boost::split(vDeploymentParams, strDeployment,
-                         boost::is_any_of(":"));
-            if (vDeploymentParams.size() != 3) {
-                return InitError("BIP9 parameters malformed, expecting "
-                                 "deployment:start:end");
-            }
-            int64_t nStartTime, nTimeout;
-            if (!ParseInt64(vDeploymentParams[1], &nStartTime)) {
-                return InitError(
-                    strprintf("Invalid nStartTime (%s)", vDeploymentParams[1]));
-            }
-            if (!ParseInt64(vDeploymentParams[2], &nTimeout)) {
-                return InitError(
-                    strprintf("Invalid nTimeout (%s)", vDeploymentParams[2]));
-            }
-            bool found = false;
-            for (int j = 0; j < (int)Consensus::MAX_VERSION_BITS_DEPLOYMENTS;
-                 ++j) {
-                if (vDeploymentParams[0].compare(
-                        VersionBitsDeploymentInfo[j].name) == 0) {
-                    UpdateBIP9Parameters(Consensus::DeploymentPos(j),
-                                         nStartTime, nTimeout);
-                    found = true;
-                    LogPrintf("Setting BIP9 activation parameters for %s to "
-                              "start=%ld, timeout=%ld\n",
-                              vDeploymentParams[0], nStartTime, nTimeout);
-                    break;
-                }
-            }
-            if (!found) {
-                return InitError(
-                    strprintf("Invalid deployment (%s)", vDeploymentParams[0]));
-            }
+    }
+
+    // Configure max number of public keys per MULTISIG operation
+    if (gArgs.IsArgSet("-maxpubkeyspermultisigpolicy"))
+    {
+        const int64_t value = gArgs.GetArg("-maxpubkeyspermultisigpolicy", DEFAULT_PUBKEYS_PER_MULTISIG_POLICY_AFTER_GENESIS);
+
+        std::string err;
+        if (!config.SetMaxPubKeysPerMultiSigPolicy(value, &err))
+        {
+            return InitError(err);
         }
+    }
+
+    // Configure maximum length of numbers in scripts
+    if (gArgs.IsArgSet("-maxscriptnumlengthpolicy"))
+    {
+        const int64_t value = gArgs.GetArg("-maxscriptnumlengthpolicy", DEFAULT_SCRIPT_NUM_LENGTH_POLICY_AFTER_GENESIS);
+        if (std::string err; !config.SetMaxScriptNumLengthPolicy(value, &err))
+        {
+            return InitError(err);
+        }
+    }
+
+    // Configure max number of blocks in which Genesis graceful period is active
+    if (gArgs.IsArgSet("-maxgenesisgracefulperiod"))
+    {
+        const int64_t value = gArgs.GetArg("-maxgenesisgracefulperiod", DEFAULT_GENESIS_GRACEFULL_ACTIVATION_PERIOD);
+
+        std::string err;
+        if (!config.SetGenesisGracefulPeriod(value, &err))
+        {
+            return InitError(err);
+        }
+    }
+
+    if (gArgs.IsArgSet("-invalidateblock"))
+    {
+        std::set<uint256> invalidBlocks;
+        for(auto invalidBlockHashStr : gArgs.GetArgs("-invalidateblock"))
+        {
+            uint256 hash = uint256S(invalidBlockHashStr);
+            invalidBlocks.insert(hash);
+        }
+        config.SetInvalidBlocks(invalidBlocks);
+    }
+
+    if (gArgs.IsArgSet("-banclientua"))
+    {
+        std::set<std::string> invalidUAClients;
+        for (auto invalidClient : gArgs.GetArgs("-banclientua"))
+        {
+            invalidUAClients.insert(invalidClient);
+        }
+        config.SetBanClientUA(invalidUAClients);
     }
 
     return true;
@@ -1724,8 +2104,72 @@ bool AppInitSanityChecks() {
     return LockDataDirectory(true);
 }
 
+void preloadChainStateThreadFunction()
+{
+#ifndef WIN32
+    auto path = boost::filesystem::canonical(GetDataDir() / "chainstate").string();
+    LogPrintf("Preload started\n");
+    try {
+        auto start = std::chrono::system_clock::now();
+        VMTouch vm;
+
+        vm.vmtouch_touch(path);
+
+        auto end = std::chrono::system_clock::now();
+
+        int64_t elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(end-start).count();
+        auto& warnings = vm.get_warnings();
+        if (!warnings.empty())
+        {
+            LogPrintf("Warnings occured during chainstate preload\n:");
+            for(auto& warning : warnings)
+            {
+                LogPrintf("Preload warning:  %s \n", warning.c_str());
+            }
+        }
+        LogPrintf("Preload finished in %" PRId64 " [ms]. Preloaded %" PRId64 " MB of data (%d %% were already present in memory)\n",
+            elapsed, vm.total_pages*vm.pagesize/ONE_MEGABYTE, (int) vm.getPagesInCorePercent());
+
+        // verify that pages were not evicted
+        VMTouch vm2;
+        int stillLoadedPercent = (int) vm2.vmtouch_check(path);
+
+        if (stillLoadedPercent < 90) {
+            LogPrintf("WARNING: Only %d %% of data still present in memory after preloading. Increae amount of free RAM to get the benefits of preloading\n", stillLoadedPercent);
+        }
+
+    }   catch(const std::runtime_error& ex) {
+        LogPrintf("Error while preloading chain state: %s\n", ex.what());
+    }
+
+#else
+    LogPrintf("Preload is not supported on this platform!");
+    return;
+#endif
+}
+
+void preloadChainState(boost::thread_group &threadGroup)
+{
+    int64_t preload;
+    preload = gArgs.GetArg("-preload", 0);
+    if (preload == 0)
+    {
+        LogPrintf("Chainstate will NOT be preloaded\n");
+        return;
+    }
+
+    if (preload == 1 )// preload with vmtouch
+    {
+        threadGroup.create_thread(boost::bind(&TraceThread<void (*)()>, "preload", preloadChainStateThreadFunction));
+    }
+    else
+    {
+        LogPrintf("Unknown value of -preload. No preloading will be done\n");
+    }
+}
+
 bool AppInitMain(Config &config, boost::thread_group &threadGroup,
-                 CScheduler &scheduler) {
+                 CScheduler &scheduler, const task::CCancellationToken& shutdownToken) {
     const CChainParams &chainparams = config.GetChainParams();
     // Step 4a: application initialization
 
@@ -1746,8 +2190,8 @@ bool AppInitMain(Config &config, boost::thread_group &threadGroup,
 
     bool default_shrinkdebugfile = logger.DefaultShrinkDebugFile();
     if (gArgs.GetBoolArg("-shrinkdebugfile", default_shrinkdebugfile)) {
-        // Do this first since it both loads a bunch of debug.log into memory,
-        // and because this needs to happen before any other debug.log printing.
+        // Do this first since it both loads a bunch of bitcoind.log into memory,
+        // and because this needs to happen before any other bitcoind.log printing.
         logger.ShrinkDebugFile();
     }
 
@@ -1772,18 +2216,14 @@ bool AppInitMain(Config &config, boost::thread_group &threadGroup,
     InitScriptExecutionCache();
 
     LogPrintf("Using %u threads for script verification\n",
-              nScriptCheckThreads);
-    if (nScriptCheckThreads) {
-        for (int i = 0; i < nScriptCheckThreads - 1; i++) {
-            threadGroup.create_thread(&ThreadScriptCheck);
-        }
-    }
+              config.GetPerBlockScriptValidatorThreadsCount());
+    InitScriptCheckQueues(config, threadGroup);
+
+    // Late configuration for globaly constructed objects
+    mempool.getNonFinalPool().loadConfig();
 
     // Start the lightweight task scheduler thread
-    CScheduler::Function serviceLoop =
-        boost::bind(&CScheduler::serviceQueue, &scheduler);
-    threadGroup.create_thread(boost::bind(&TraceThread<CScheduler::Function>,
-                                          "scheduler", serviceLoop));
+    scheduler.startServiceThread(threadGroup);
 
     /* Start the RPC server already.  It will be started in "warmup" mode
      * and not really process calls already (but it will signify connections
@@ -1798,7 +2238,18 @@ bool AppInitMain(Config &config, boost::thread_group &threadGroup,
         }
     }
 
-    int64_t nStart;
+    if (gArgs.IsArgSet("-maxopsperscriptpolicy"))
+    {
+        const int64_t value = gArgs.GetArg("-maxopsperscriptpolicy", 0);
+
+        std::string err;
+        if (!config.SetMaxOpsPerScriptPolicy(value, &err))
+        {
+            return InitError(err);
+        }
+    }
+
+    int64_t nStart=0;
 
 // Step 5: verify wallet database integrity
 #ifdef ENABLE_WALLET
@@ -1814,12 +2265,23 @@ bool AppInitMain(Config &config, boost::thread_group &threadGroup,
     // need to reindex later.
 
     assert(!g_connman);
-    g_connman = std::unique_ptr<CConnman>(
-        new CConnman(config, GetRand(std::numeric_limits<uint64_t>::max()),
-                     GetRand(std::numeric_limits<uint64_t>::max())));
+    {
+        int64_t duration = gArgs.GetArg("-debugp2pthreadstalls", 0);
+        g_connman =
+            std::make_unique<CConnman>(
+                config, GetRand(std::numeric_limits<uint64_t>::max()),
+                GetRand(std::numeric_limits<uint64_t>::max()),
+                std::chrono::milliseconds{duration > 0 ? duration : 0});
+    }
     CConnman &connman = *g_connman;
 
     peerLogic.reset(new PeerLogicValidation(&connman));
+    if (gArgs.IsArgSet("-broadcastdelay")) {
+        const int64_t nDelayMillisecs = gArgs.GetArg("-broadcastdelay", DEFAULT_INV_BROADCAST_DELAY);
+        if(!SetInvBroadcastDelay(nDelayMillisecs)){
+            return InitError(strprintf(_("Error setting broadcastdelay=%d"), nDelayMillisecs));
+        }
+    }
     RegisterValidationInterface(peerLogic.get());
     RegisterNodeSignals(GetNodeSignals());
 
@@ -2016,7 +2478,7 @@ bool AppInitMain(Config &config, boost::thread_group &threadGroup,
               nMempoolSizeMax * (1.0 / 1024 / 1024));
 
     bool fLoaded = false;
-    while (!fLoaded && !fRequestShutdown) {
+    while (!fLoaded && !shutdownToken.IsCanceled()) {
         bool fReset = fReindex;
         std::string strLoadError;
 
@@ -2048,7 +2510,7 @@ bool AppInitMain(Config &config, boost::thread_group &threadGroup,
                     strLoadError = _("Error upgrading chainstate database");
                     break;
                 }
-                if (fRequestShutdown) break;
+                if (shutdownToken.IsCanceled()) break;
 
                 if (!LoadBlockIndex(chainparams)) {
                     strLoadError = _("Error loading block database");
@@ -2098,7 +2560,10 @@ bool AppInitMain(Config &config, boost::thread_group &threadGroup,
                 }
 
                 pcoinsTip = new CCoinsViewCache(pcoinscatcher);
-                LoadChainTip(chainparams);
+                {
+                    LOCK(cs_main);
+                    LoadChainTip(chainparams);
+                }
 
                 if (!fReindex && chainActive.Tip() != nullptr) {
                     uiInterface.InitMessage(_("Rewinding blocks..."));
@@ -2140,10 +2605,14 @@ bool AppInitMain(Config &config, boost::thread_group &threadGroup,
                 if (!CVerifyDB().VerifyDB(
                         config, pcoinsdbview,
                         gArgs.GetArg("-checklevel", DEFAULT_CHECKLEVEL),
-                        gArgs.GetArg("-checkblocks", DEFAULT_CHECKBLOCKS))) {
+                        gArgs.GetArg("-checkblocks", DEFAULT_CHECKBLOCKS),
+                        shutdownToken)) {
                     strLoadError = _("Corrupted block database detected");
                     break;
                 }
+
+                InvalidateBlocksFromConfig(config);
+
             } catch (const std::exception &e) {
                 LogPrintf("%s\n", e.what());
                 strLoadError = _("Error opening block database");
@@ -2153,7 +2622,7 @@ bool AppInitMain(Config &config, boost::thread_group &threadGroup,
             fLoaded = true;
         } while (false);
 
-        if (!fLoaded && !fRequestShutdown) {
+        if (!fLoaded && !shutdownToken.IsCanceled()) {
             // first suggest a reindex
             if (!fReset) {
                 bool fRet = uiInterface.ThreadSafeQuestion(
@@ -2164,9 +2633,8 @@ bool AppInitMain(Config &config, boost::thread_group &threadGroup,
                     "",
                     CClientUIInterface::MSG_ERROR |
                         CClientUIInterface::BTN_ABORT);
-                if (fRet) {
+                if (fRet && !shutdownToken.IsCanceled()) {
                     fReindex = true;
-                    fRequestShutdown = false;
                 } else {
                     LogPrintf("Aborted block database rebuild. Exiting.\n");
                     return false;
@@ -2180,23 +2648,18 @@ bool AppInitMain(Config &config, boost::thread_group &threadGroup,
     // As LoadBlockIndex can take several minutes.
     // As the program has not fully started yet, Shutdown() is possibly
     // overkill.
-    if (fRequestShutdown) {
+    if (shutdownToken.IsCanceled()) {
         LogPrintf("Shutdown requested. Exiting.\n");
         return false;
     }
+
+    // After block chain is loaded check fork tip statuses and
+    // restore global safe mode state.
+    CheckSafeModeParametersForAllForksOnStartup();
+
     LogPrintf(" block index %15dms\n", GetTimeMillis() - nStart);
+  
 
-    fs::path est_path = GetDataDir() / FEE_ESTIMATES_FILENAME;
-    CAutoFile est_filein(fsbridge::fopen(est_path, "rb"), SER_DISK,
-                         CLIENT_VERSION);
-    // Allowed to fail as this file IS missing on first startup.
-    if (!est_filein.IsNull()) mempool.ReadFeeEstimates(est_filein);
-    fFeeEstimatesInitialized = true;
-
-    // Encoded addresses using cashaddr instead of base58
-    // Activates by default on Jan, 14
-    config.SetCashAddrEncoding(
-        gArgs.GetBoolArg("-usecashaddr", GetAdjustedTime() > 1515900000));
 
 // Step 8: load wallet
 #ifdef ENABLE_WALLET
@@ -2245,7 +2708,12 @@ bool AppInitMain(Config &config, boost::thread_group &threadGroup,
     }
 
     threadGroup.create_thread(
-        boost::bind(&ThreadImport, std::ref(config), vImportFiles));
+        [&config, vImportFiles, shutdownToken]
+        {
+            TraceThread(
+                "import_files",
+                [&config, &vImportFiles, shutdownToken]{ThreadImport(config, vImportFiles, shutdownToken);});
+        });
 
     // Wait for genesis block to be processed
     {
@@ -2256,10 +2724,15 @@ bool AppInitMain(Config &config, boost::thread_group &threadGroup,
         uiInterface.NotifyBlockTip.disconnect(BlockNotifyGenesisWait);
     }
 
+    preloadChainState(threadGroup);
+
     // Step 11: start node
 
     //// debug print
-    LogPrintf("mapBlockIndex.size() = %u\n", mapBlockIndex.size());
+    {
+        LOCK(cs_main);
+        LogPrintf("mapBlockIndex.size() = %u\n", mapBlockIndex.size());
+    }
     LogPrintf("nBestHeight = %d\n", chainActive.Height());
     if (gArgs.GetBoolArg("-listenonion", DEFAULT_LISTEN_ONION)) {
         StartTorControl(threadGroup, scheduler);
@@ -2293,9 +2766,17 @@ bool AppInitMain(Config &config, boost::thread_group &threadGroup,
         return InitError(strNodeError);
     }
 
+    // Create mining factory
+    assert(!mining::g_miningFactory);
+    mining::g_miningFactory = std::make_unique<mining::CMiningFactory>(config);
+
+    // Launch non-final mempool periodic checks
+    mempool.getNonFinalPool().startPeriodicChecks(scheduler);
+
     // Step 12: finished
 
     SetRPCWarmupFinished();
+
     uiInterface.InitMessage(_("Done loading"));
 
 #ifdef ENABLE_WALLET
@@ -2304,5 +2785,5 @@ bool AppInitMain(Config &config, boost::thread_group &threadGroup,
     }
 #endif
 
-    return !fRequestShutdown;
+    return !shutdownToken.IsCanceled();
 }

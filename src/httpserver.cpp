@@ -354,8 +354,10 @@ static bool HTTPBindAddresses(struct evhttp *http) {
 }
 
 /** Simple wrapper to set thread name and run work queue */
-static void HTTPWorkQueueRun(WorkQueue<HTTPClosure> *queue) {
-    RenameThread("bitcoin-httpworker");
+static void HTTPWorkQueueRun(WorkQueue<HTTPClosure> *queue, int workerNum)
+{
+    std::string s = strprintf("bitcoin-httpworker%d", workerNum);
+    RenameThread(s.c_str());
     queue->Run();
 }
 
@@ -371,6 +373,21 @@ static void libevent_log_cb(int severity, const char *msg) {
     } else {
         LogPrint(BCLog::LIBEVENT, "libevent: %s\n", msg);
     }
+}
+
+ev_ssize_t GetMaxBodySizeSafe(uint64_t maxBlockSize)
+{    
+    ev_ssize_t maxBodySize{ 0 };
+    constexpr auto maxSsize = std::numeric_limits<ev_ssize_t>::max();
+    if (maxBlockSize > (maxSsize / 2 - MIN_SUPPORTED_BODY_SIZE))
+    {
+        maxBodySize = maxSsize;
+    }
+    else
+    {
+        maxBodySize = MIN_SUPPORTED_BODY_SIZE + 2 * maxBlockSize;
+    }
+    return maxBodySize;
 }
 
 bool InitHTTPServer(Config &config) {
@@ -422,8 +439,7 @@ bool InitHTTPServer(Config &config) {
     evhttp_set_timeout(
         http, gArgs.GetArg("-rpcservertimeout", DEFAULT_HTTP_SERVER_TIMEOUT));
     evhttp_set_max_headers_size(http, MAX_HEADERS_SIZE);
-    evhttp_set_max_body_size(
-        http, MIN_SUPPORTED_BODY_SIZE + 2 * config.GetMaxBlockSize());
+    evhttp_set_max_body_size(http, GetMaxBodySizeSafe(config.GetMaxBlockSize()));
     evhttp_set_gencb(http, http_request_cb, &config);
 
     // Only POST and OPTIONS are supported, but we return HTTP 405 for the
@@ -464,7 +480,7 @@ bool StartHTTPServer() {
     threadHTTP = std::thread(std::move(task), eventBase, eventHTTP);
 
     for (int i = 0; i < rpcThreads; i++) {
-        std::thread rpc_worker(HTTPWorkQueueRun, workQueue);
+        std::thread rpc_worker(HTTPWorkQueueRun, workQueue, i);
         rpc_worker.detach();
     }
     return true;
@@ -523,6 +539,7 @@ struct event_base *EventBase() {
     return eventBase;
 }
 
+// this callback is called after successful or failed transmission
 static void httpevent_callback_fn(evutil_socket_t, short, void *data) {
     // Static handler: simply call inner handler
     HTTPEvent *self = ((HTTPEvent *)data);
@@ -613,6 +630,31 @@ void HTTPRequest::WriteReply(int nStatus, const std::string &strReply) {
     ev->trigger(0);
     replySent = true;
     // transferred back to main thread.
+    req = 0;
+}
+
+void HTTPRequest::StartWritingChunks(int nStatus) {
+    HTTPEvent *ev = new HTTPEvent(eventBase, true, std::bind(evhttp_send_reply_start, req, nStatus, (const char *)nullptr));
+    ev->trigger(nullptr);
+}
+
+void HTTPRequest::WriteReplyChunk(std::string_view strReply) {
+    struct evbuffer *evb = evbuffer_new();
+    evbuffer_add(evb, strReply.data(), strReply.length());
+
+    // Send event to main http thread to send reply message
+    HTTPEvent *ev = new HTTPEvent(eventBase, true, std::bind(evhttp_send_reply_chunk, req, evb));
+    ev->trigger(nullptr);
+
+    HTTPEvent *evDel = new HTTPEvent(eventBase, true, std::bind(evbuffer_free, evb));
+    evDel->trigger(nullptr);
+}
+
+void HTTPRequest::StopWritingChunks() {
+    HTTPEvent *ev = new HTTPEvent(eventBase, true, std::bind(evhttp_send_reply_end, req));
+    ev->trigger(nullptr);
+
+    replySent = true;
     req = 0;
 }
 

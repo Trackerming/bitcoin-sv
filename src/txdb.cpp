@@ -1,7 +1,7 @@
 // Copyright (c) 2009-2010 Satoshi Nakamoto
 // Copyright (c) 2009-2016 The Bitcoin Core developers
-// Distributed under the MIT software license, see the accompanying
-// file COPYING or http://www.opensource.org/licenses/mit-license.php.
+// Copyright (c) 2019 Bitcoin Association
+// Distributed under the Open BSV software license, see the accompanying file LICENSE.
 
 #include "txdb.h"
 
@@ -14,6 +14,7 @@
 #include "ui_interface.h"
 #include "uint256.h"
 #include "util.h"
+#include "validation.h" // required for IsGenesisEnabled()
 
 #include <boost/thread.hpp>
 
@@ -197,6 +198,29 @@ CCoinsViewCursor *CCoinsViewDB::Cursor() const {
     return i;
 }
 
+// Same as CCoinsViewCursor::Cursor() with added Seek() to key txId
+CCoinsViewCursor* CCoinsViewDB::Cursor(const TxId &txId) const {
+    CCoinsViewDBCursor* i = new CCoinsViewDBCursor(
+        const_cast<CDBWrapper&>(db).NewIterator(), GetBestBlock());
+    
+    COutPoint op = COutPoint(txId, 0);
+    CoinEntry key = CoinEntry(&op);
+
+    i->pcursor->Seek(key);
+
+    // Cache key of first record
+    if (i->pcursor->Valid()) {
+        CoinEntry entry(&i->keyTmp.second);
+        i->pcursor->GetKey(entry);
+        i->keyTmp.first = entry.key;
+    }
+    else {
+        // Make sure Valid() and GetKey() return false
+        i->keyTmp.first = 0;
+    }
+    return i;
+}
+
 bool CCoinsViewDBCursor::GetKey(COutPoint &key) const {
     // Return cached key
     if (keyTmp.first == DB_COIN) {
@@ -297,18 +321,9 @@ bool CBlockTreeDB::LoadBlockIndexGuts(
 
         // Construct block index object
         CBlockIndex *pindexNew = insertBlockIndex(diskindex.GetBlockHash());
-        pindexNew->pprev = insertBlockIndex(diskindex.hashPrev);
-        pindexNew->nHeight = diskindex.nHeight;
-        pindexNew->nFile = diskindex.nFile;
-        pindexNew->nDataPos = diskindex.nDataPos;
-        pindexNew->nUndoPos = diskindex.nUndoPos;
-        pindexNew->nVersion = diskindex.nVersion;
-        pindexNew->hashMerkleRoot = diskindex.hashMerkleRoot;
-        pindexNew->nTime = diskindex.nTime;
-        pindexNew->nBits = diskindex.nBits;
-        pindexNew->nNonce = diskindex.nNonce;
-        pindexNew->nStatus = diskindex.nStatus;
-        pindexNew->nTx = diskindex.nTx;
+        pindexNew->LoadFromPersistentData(
+            diskindex,
+            insertBlockIndex(diskindex.hashPrev));
 
         if (!CheckProofOfWork(pindexNew->GetBlockHash(), pindexNew->nBits,
                               config)) {
@@ -399,9 +414,6 @@ bool CCoinsViewDB::Upgrade() {
     std::pair<uint8_t, uint256> prev_key = {DB_COINS, uint256()};
     while (pcursor->Valid()) {
         boost::this_thread::interruption_point();
-        if (ShutdownRequested()) {
-            break;
-        }
 
         if (!pcursor->GetKey(key) || key.first != DB_COINS) {
             break;
@@ -430,7 +442,7 @@ bool CCoinsViewDB::Upgrade() {
         TxId id(key.second);
         for (size_t i = 0; i < old_coins.vout.size(); ++i) {
             if (!old_coins.vout[i].IsNull() &&
-                !old_coins.vout[i].scriptPubKey.IsUnspendable()) {
+                !old_coins.vout[i].scriptPubKey.IsUnspendable(IsGenesisEnabled(GlobalConfig::GetConfig(), old_coins.nHeight))) {
                 Coin newcoin(std::move(old_coins.vout[i]), old_coins.nHeight,
                              old_coins.fCoinBase);
                 COutPoint outpoint(id, i);
@@ -453,6 +465,6 @@ bool CCoinsViewDB::Upgrade() {
     db.WriteBatch(batch);
     db.CompactRange({DB_COINS, uint256()}, key);
     uiInterface.SetProgressBreakAction(std::function<void(void)>());
-    LogPrintf("[%s].\n", ShutdownRequested() ? "CANCELLED" : "DONE");
-    return !ShutdownRequested();
+    LogPrintf("[%s].\n", "DONE");
+    return true;
 }

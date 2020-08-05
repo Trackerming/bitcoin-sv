@@ -1,7 +1,7 @@
 // Copyright (c) 2010 Satoshi Nakamoto
 // Copyright (c) 2009-2016 The Bitcoin Core developers
-// Distributed under the MIT software license, see the accompanying
-// file COPYING or http://www.opensource.org/licenses/mit-license.php.
+// Copyright (c) 2019 Bitcoin Association
+// Distributed under the Open BSV software license, see the accompanying file LICENSE.
 
 #include "rpc/misc.h"
 #include "base58.h"
@@ -22,7 +22,10 @@
 #include "wallet/rpcwallet.h"
 #include "wallet/wallet.h"
 #include "wallet/walletdb.h"
+
 #endif
+
+#include "vmtouch.h"
 
 #include <univalue.h>
 
@@ -83,6 +86,10 @@ static UniValue getinfo(const Config &config, const JSONRPCRequest &request) {
             "size we will accept from any source\n"
             "  \"maxminedblocksize\": xxxxx  (numeric) The maximum block size "
             "we will mine\n"
+            "  \"maxstackmemoryusagepolicy\": xxxxx, (numeric) Policy value of "
+            "max stack memory usage\n"
+            "  \"maxStackMemoryUsageConsensus\": xxxxx, (numeric) Consensus value of "
+            "max stack memory usage\n"
             "}\n"
             "\nExamples:\n" +
             HelpExampleCli("getinfo", "") + HelpExampleRpc("getinfo", ""));
@@ -121,6 +128,9 @@ static UniValue getinfo(const Config &config, const JSONRPCRequest &request) {
     obj.push_back(Pair("testnet",
                        config.GetChainParams().NetworkIDString() ==
                            CBaseChainParams::TESTNET));
+    obj.push_back(Pair("stn",
+                       config.GetChainParams().NetworkIDString() ==
+                       CBaseChainParams::STN));
 #ifdef ENABLE_WALLET
     if (pwallet) {
         obj.push_back(Pair("keypoololdest", pwallet->GetOldestKeyPoolTime()));
@@ -135,7 +145,11 @@ static UniValue getinfo(const Config &config, const JSONRPCRequest &request) {
                        ValueFromAmount(config.GetMinFeePerKB().GetFeePerK())));
     obj.push_back(Pair("errors", GetWarnings("statusbar")));
     obj.push_back(Pair("maxblocksize", config.GetMaxBlockSize()));
-    obj.push_back(Pair("maxminedblocksize", gArgs.GetArg("-blockmaxsize", DEFAULT_MAX_GENERATED_BLOCK_SIZE)));
+    obj.push_back(Pair("maxminedblocksize", config.GetMaxGeneratedBlockSize()));
+    obj.push_back(Pair("maxstackmemoryusagepolicy", 
+                       config.GetMaxStackMemoryUsage(true, false)));
+    obj.push_back(Pair("maxstackmemoryusageconsensus",
+                       config.GetMaxStackMemoryUsage(true, true)));
     return obj;
 }
 
@@ -169,7 +183,10 @@ public:
             std::vector<CTxDestination> addresses;
             txnouttype whichType;
             int nRequired;
-            ExtractDestinations(subscript, whichType, addresses, nRequired);
+            // DescribeAddressVisitor is used by RPC call validateaddress, which only takes address as input. 
+            // We have no block height available - treat all transactions as post-Genesis except P2SH to be able to spend them.
+            bool isGenesisEnabled = subscript.IsPayToScriptHash() ? false : true; 
+            ExtractDestinations(subscript, isGenesisEnabled, whichType, addresses, nRequired);
             obj.push_back(Pair("script", GetTxnOutputType(whichType)));
             obj.push_back(
                 Pair("hex", HexStr(subscript.begin(), subscript.end())));
@@ -353,10 +370,10 @@ CScript createmultisig_redeemScript(CWallet *const pwallet,
     }
 
     CScript result = GetScriptForMultisig(nRequired, pubkeys);
-    if (result.size() > MAX_SCRIPT_ELEMENT_SIZE) {
+    if (result.size() > MAX_SCRIPT_ELEMENT_SIZE_BEFORE_GENESIS) {
         throw std::runtime_error(
             strprintf("redeemScript exceeds size limit: %d > %d", result.size(),
-                      MAX_SCRIPT_ELEMENT_SIZE));
+                      MAX_SCRIPT_ELEMENT_SIZE_BEFORE_GENESIS));
     }
 
     return result;
@@ -562,7 +579,7 @@ static UniValue setmocktime(const Config &config,
 
     // For now, don't change mocktime if we're in the middle of validation, as
     // this could have an effect on mempool time-based eviction, as well as
-    // IsCurrentForFeeEstimation() and IsInitialBlockDownload().
+    // IsInitialBlockDownload().
     // TODO: figure out the right way to synchronize around mocktime, and
     // ensure all callsites of GetTime() are accessing this safely.
     LOCK(cs_main);
@@ -582,6 +599,23 @@ static UniValue RPCLockedMemoryInfo() {
     obj.push_back(Pair("locked", uint64_t(stats.locked)));
     obj.push_back(Pair("chunks_used", uint64_t(stats.chunks_used)));
     obj.push_back(Pair("chunks_free", uint64_t(stats.chunks_free)));
+    return obj;
+}
+
+static UniValue TouchedPagesInfo() {
+    UniValue obj(UniValue::VOBJ);
+    double percents = 0.0;
+#ifndef WIN32
+    VMTouch vm;
+    try {
+        auto path = GetDataDir() / "chainstate";
+        std::string result = boost::filesystem::canonical(path).string();
+        percents = vm.vmtouch_check(result);
+    }   catch(const std::runtime_error& ex) {
+        LogPrintf("Error while preloading chain state: %s\n", ex.what());
+    }
+#endif
+    obj.push_back(Pair("chainStateCached", percents));
     return obj;
 }
 
@@ -618,6 +652,7 @@ static UniValue getmemoryinfo(const Config &config,
 
     UniValue obj(UniValue::VOBJ);
     obj.push_back(Pair("locked", RPCLockedMemoryInfo()));
+    obj.push_back(Pair("preloading", TouchedPagesInfo()));
     return obj;
 }
 

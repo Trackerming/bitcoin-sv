@@ -9,7 +9,6 @@
 #include "data/base58_keys_valid.json.h"
 
 #include "key.h"
-#include "script/script.h"
 #include "test/jsonutil.h"
 #include "test/test_bitcoin.h"
 #include "uint256.h"
@@ -162,7 +161,7 @@ BOOST_AUTO_TEST_CASE(base58_keys_valid_parse) {
                                 "key mismatch:" + strTest);
 
             // Private key must be invalid public key
-            destination = DecodeLegacyAddr(exp_base58string, Params());
+            destination = DecodeBase58Addr(exp_base58string, Params());
             BOOST_CHECK_MESSAGE(!IsValidDestination(destination),
                                 "IsValid privkey as pubkey:" + strTest);
         } else {
@@ -170,7 +169,7 @@ BOOST_AUTO_TEST_CASE(base58_keys_valid_parse) {
             std::string exp_addrType =
                 find_value(metadata, "addrType").get_str();
             // Must be valid public key
-            destination = DecodeLegacyAddr(exp_base58string, Params());
+            destination = DecodeBase58Addr(exp_base58string, Params());
             BOOST_CHECK_MESSAGE(IsValidDestination(destination),
                                 "!IsValid:" + strTest);
             BOOST_CHECK_MESSAGE((boost::get<CScriptID>(&destination) !=
@@ -235,7 +234,7 @@ BOOST_AUTO_TEST_CASE(base58_keys_valid_gen) {
                 BOOST_ERROR("Bad addrtype: " << strTest);
                 continue;
             }
-            std::string address = EncodeLegacyAddr(dest, Params());
+            std::string address = EncodeBase58Addr(dest, Params());
             BOOST_CHECK_MESSAGE(address == exp_base58string,
                                 "mismatch: " + strTest);
         }
@@ -266,7 +265,7 @@ BOOST_AUTO_TEST_CASE(base58_keys_invalid) {
         std::string exp_base58string = test[0].get_str();
 
         // must be invalid as public and as private key
-        destination = DecodeLegacyAddr(exp_base58string, Params());
+        destination = DecodeBase58Addr(exp_base58string, Params());
         BOOST_CHECK_MESSAGE(!IsValidDestination(destination),
                             "IsValid pubkey:" + strTest);
         secret.SetString(exp_base58string);

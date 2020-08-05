@@ -1,8 +1,8 @@
 // Copyright (c) 2009-2010 Satoshi Nakamoto
 // Copyright (c) 2009-2016 The Bitcoin Core developers
 // Copyright (c) 2017 The Bitcoin developers
-// Distributed under the MIT software license, see the accompanying
-// file COPYING or http://www.opensource.org/licenses/mit-license.php.
+// Copyright (c) 2019-2020 Bitcoin Association
+// Distributed under the Open BSV software license, see the accompanying file LICENSE.
 
 #ifndef BITCOIN_NET_H
 #define BITCOIN_NET_H
@@ -21,41 +21,57 @@
 #include "random.h"
 #include "streams.h"
 #include "sync.h"
+#include "task_helpers.h"
 #include "threadinterrupt.h"
+#include "txmempool.h"
+#include "txn_sending_details.h"
 #include "uint256.h"
+#include "validation.h"
 
 #include <atomic>
 #include <condition_variable>
+#include <chrono>
 #include <cstdint>
 #include <deque>
 #include <memory>
+#include <optional>
 #include <thread>
+#include <vector>
+#include <functional>
 
 #ifndef WIN32
 #include <arpa/inet.h>
 #endif
 
+#include <boost/circular_buffer.hpp>
 #include <boost/signals2/signal.hpp>
 
 class CAddrMan;
 class Config;
 class CNode;
 class CScheduler;
+class CTxnPropagator;
+class CTxnValidator;
+
+using CNodePtr = std::shared_ptr<CNode>;
 
 namespace boost {
 class thread_group;
 } // namespace boost
+
+namespace task
+{
+    class CCancellationSource;
+}
 
 /** Time between pings automatically sent out for latency probing and keepalive
  * (in seconds). */
 static const int PING_INTERVAL = 2 * 60;
 /** Time after which to disconnect, after waiting for a ping response (or
  * inactivity). */
-static const int TIMEOUT_INTERVAL = 20 * 60;
+static const int DEFAULT_P2P_TIMEOUT_INTERVAL = 20 * 60;
 /** Run the feeler connection loop once every 2 minutes or 120 seconds. **/
 static const int FEELER_INTERVAL = 120;
-/** The maximum number of entries in an 'inv' protocol message */
-static const unsigned int MAX_INV_SZ = 50000;
 /** The maximum number of new addresses to accumulate before announcing. */
 static const unsigned int MAX_ADDR_TO_SEND = 1000;
 /** Maximum length of strSubVer in `version` message */
@@ -72,10 +88,6 @@ static const bool DEFAULT_UPNP = USE_UPNP;
 #else
 static const bool DEFAULT_UPNP = false;
 #endif
-/** The maximum number of entries in mapAskFor */
-static const size_t MAPASKFOR_MAX_SZ = MAX_INV_SZ;
-/** The maximum number of entries in setAskFor (larger due to getdata latency)*/
-static const size_t SETASKFOR_MAX_SZ = 2 * MAX_INV_SZ;
 /** The maximum number of peer connections to maintain. */
 static const unsigned int DEFAULT_MAX_PEER_CONNECTIONS = 125;
 /** The default for -maxuploadtarget. 0 = Unlimited */
@@ -84,6 +96,15 @@ static const uint64_t DEFAULT_MAX_UPLOAD_TARGET = 0;
 static const uint64_t MAX_UPLOAD_TIMEFRAME = 60 * 60 * 24;
 /** Default for blocks only*/
 static const bool DEFAULT_BLOCKSONLY = false;
+/** Default factor that will be multiplied with excessiveBlockSize
+* to limit the maximum bytes in all sending queues. If this
+* size is exceeded, no response to block related P2P messages is sent.
+**/
+static const unsigned int DEFAULT_FACTOR_MAX_SEND_QUEUES_BYTES = 4;
+/** Microseconds in a second */
+static const unsigned int MICROS_PER_SECOND = 1000000;
+/** Peer average bandwidth measurement interval */
+static const unsigned PEER_AVG_BANDWIDTH_CALC_FREQUENCY_SECS = 5;
 
 // Force DNS seed use ahead of UAHF fork, to ensure peers are found
 // as long as seeders are working.
@@ -98,6 +119,12 @@ static const ServiceFlags REQUIRED_SERVICES = ServiceFlags(NODE_NETWORK);
 // NOTE: When adjusting this, update rpcnet:setban's help ("24h")
 static const unsigned int DEFAULT_MISBEHAVING_BANTIME = 60 * 60 * 24;
 
+/**
+ * Default maximum amount of concurrent async tasks per node before node message
+ * processing is skipped until the amount is freed up again.
+ */
+constexpr size_t DEFAULT_NODE_ASYNC_TASKS_LIMIT = 3;
+
 typedef int64_t NodeId;
 
 struct AddedNodeInfo {
@@ -107,20 +134,71 @@ struct AddedNodeInfo {
     bool fInbound;
 };
 
+class CGetBlockMessageRequest
+{
+public:
+    CGetBlockMessageRequest(CDataStream& vRecv)
+        : mRequestTime{std::chrono::system_clock::now()}
+    {
+        vRecv >> mLocator >> mHashStop;
+    }
+
+    auto GetRequestTime() const
+        -> const std::chrono::time_point<std::chrono::system_clock>&
+    {
+        return mRequestTime;
+    }
+    const CBlockLocator& GetLocator() const {return mLocator;}
+    const uint256& GetHashStop() const {return mHashStop;}
+private:
+    std::chrono::time_point<std::chrono::system_clock> mRequestTime;
+    CBlockLocator mLocator;
+    uint256 mHashStop;
+};
+
 class CTransaction;
 class CNodeStats;
 class CClientUIInterface;
 
-struct CSerializedNetMsg {
-    CSerializedNetMsg() = default;
+class CSerializedNetMsg
+{
+public:
     CSerializedNetMsg(CSerializedNetMsg &&) = default;
     CSerializedNetMsg &operator=(CSerializedNetMsg &&) = default;
     // No copying, only moves.
     CSerializedNetMsg(const CSerializedNetMsg &msg) = delete;
     CSerializedNetMsg &operator=(const CSerializedNetMsg &) = delete;
 
-    std::vector<uint8_t> data;
-    std::string command;
+    CSerializedNetMsg(
+        std::string&& command,
+        std::vector<uint8_t>&& data)
+        : mCommand{std::move(command)}
+        , mHash{::Hash(data.data(), data.data() + data.size())}
+        , mSize{data.size()}
+        , mData{std::make_unique<CVectorStream>(std::move(data))}
+    {/**/}
+
+    CSerializedNetMsg(
+        std::string&& command,
+        const uint256& hash,
+        size_t size,
+        std::unique_ptr<CForwardAsyncReadonlyStream> data)
+        : mCommand{std::move(command)}
+        , mHash{hash}
+        , mSize{size}
+        , mData{std::move(data)}
+    {/**/}
+
+    const std::string& Command() const {return mCommand;}
+    std::unique_ptr<CForwardAsyncReadonlyStream> MoveData() {return std::move(mData);}
+    const uint256& Hash() const {return mHash;}
+    size_t Size() const {return mSize;}
+
+private:
+    std::string mCommand;
+    uint256 mHash;
+    size_t mSize;
+    std::unique_ptr<CForwardAsyncReadonlyStream> mData;
 };
 
 class CConnman {
@@ -146,7 +224,11 @@ public:
         uint64_t nMaxOutboundTimeframe = 0;
         uint64_t nMaxOutboundLimit = 0;
     };
-    CConnman(const Config &configIn, uint64_t seed0, uint64_t seed1);
+    CConnman(
+        const Config &configIn,
+        uint64_t seed0,
+        uint64_t seed1,
+        std::chrono::milliseconds debugP2PTheadStallsThreshold);
     ~CConnman();
     bool Start(CScheduler &scheduler, std::string &strNodeError,
                Options options);
@@ -163,41 +245,172 @@ public:
                                bool fAddnode = false);
     bool CheckIncomingNonce(uint64_t nonce);
 
-    bool ForNode(NodeId id, std::function<bool(CNode *pnode)> func);
+    bool ForNode(NodeId id, std::function<bool(const CNodePtr& pnode)> func);
 
-    void PushMessage(CNode *pnode, CSerializedNetMsg &&msg);
+    void PushMessage(const CNodePtr& pnode, CSerializedNetMsg &&msg);
 
-    template <typename Callable> void ForEachNode(Callable &&func) {
+    /** Enqueue a new transaction for later sending to our peers */
+    void EnqueueTransaction(const CTxnSendingDetails& txn);
+    /** Remove some transactions from our peers list of new transactions */
+    void DequeueTransactions(const std::vector<CTransactionRef>& txns);
+
+    /** Get a handle to our transaction propagator */
+    const std::shared_ptr<CTxnPropagator>& getTransactionPropagator() const { return mTxnPropagator; }
+
+    /** Call the specified function for each node */
+    template <typename Callable> void ForEachNode(Callable&& func) const {
         LOCK(cs_vNodes);
-        for (auto &&node : vNodes) {
-            if (NodeFullyConnected(node)) func(node);
+        for(const CNodePtr& node : vNodes) {
+            if(NodeFullyConnected(node))
+                func(node);
         }
     };
 
-    template <typename Callable> void ForEachNode(Callable &&func) const {
+    /** Call the specified function for each node in parallel */
+    template <typename Callable>
+    auto ParallelForEachNode(Callable&& func)
+        -> std::vector<std::future<typename std::result_of<Callable(const CNodePtr&)>::type>>
+    {
+        using resultType = typename std::result_of<Callable(const CNodePtr&)>::type;
+        std::vector<std::future<resultType>> results {};
+
         LOCK(cs_vNodes);
-        for (auto &&node : vNodes) {
-            if (NodeFullyConnected(node)) func(node);
+        results.reserve(vNodes.size());
+        for(const CNodePtr& node : vNodes) {
+            if(NodeFullyConnected(node))
+                results.emplace_back(make_task(mThreadPool, func, node));
         }
+
+        return results;
     };
 
-    template <typename Callable, typename CallableAfter>
-    void ForEachNodeThen(Callable &&pre, CallableAfter &&post) {
-        LOCK(cs_vNodes);
-        for (auto &&node : vNodes) {
-            if (NodeFullyConnected(node)) pre(node);
-        }
-        post();
-    };
+    /** Call the specified function for parallel validation */
+    template <typename Callable>
+    auto ParallelTxnValidation(
+            Callable&& func,
+            const Config* config,
+            CTxMemPool *pool,
+            TxInputDataSPtrVec& vNewTxns,
+            CTxnHandlers& handlers,
+            bool fUseTimedCancellationSource,
+            std::chrono::milliseconds maxasynctasksrunduration)
+        -> std::vector<std::future<typename std::result_of<
+            Callable(const TxInputDataSPtrRefVec&,
+                const Config*,
+                CTxMemPool*,
+                CTxnHandlers&,
+                bool,
+                std::chrono::steady_clock::time_point)>::type>> {
+        using resultType = typename std::result_of<
+            Callable(const TxInputDataSPtrRefVec&,
+                const Config*,
+                CTxMemPool*,
+                CTxnHandlers&,
+                bool,
+                std::chrono::steady_clock::time_point)>::type;
+        // Reserve a space for the result set (a pessimistic estimation).
+        std::vector<std::future<resultType>> results {};
+        results.reserve(vNewTxns.size());
+        // Set end_time_point based on the current time and max duration for async tasks.
+        std::chrono::steady_clock::time_point zero_time_point(std::chrono::milliseconds(0));
+        std::chrono::steady_clock::time_point end_time_point =
+            std::chrono::steady_clock::time_point(maxasynctasksrunduration) == zero_time_point
+                ? zero_time_point : std::chrono::steady_clock::now() + maxasynctasksrunduration;
+        // A helper lambda to create a task.
+        auto create_task {
+            [&](TxInputDataSPtrVecIter begin, TxInputDataSPtrVecIter end, TxValidationPriority priority) {
+                results.emplace_back(
+                    make_task(
+                        mValidatorThreadPool,
+                        priority == TxValidationPriority::low ? CTask::Priority::Low : CTask::Priority::High,
+                        func,
+                        TxInputDataSPtrRefVec(begin, end),
+                        config,
+                        pool,
+                        handlers,
+                        fUseTimedCancellationSource,
+                        end_time_point));
+            }
+        };
+        auto chunkBeginIter = vNewTxns.begin();
+        auto chunkEndIter = chunkBeginIter;
+        // mChains is used to track transacions belonging to the same chain (among the given vNewTxns set).
+        std::size_t chainId = 0;
+        std::map<TxId, std::size_t> mChains {};
+        mChains.emplace(chunkBeginIter->get()->mpTx->GetId(), ++chainId);
+        // A helper lambda used to identify a continuous chain
+        // (a sequence of transactions compliant with the parent-child rule).
+        auto is_continuous_chain {
+            [&mChains, &chunkEndIter](std::size_t chainId) -> std::pair<bool, std::size_t> {
+                for (const auto& txin : chunkEndIter->get()->mpTx->vin) {
+                    const TxId& txhash = txin.prevout.GetTxId();
+                    const auto& foundParentIter = mChains.find(txhash);
+                    if (foundParentIter != mChains.end()) {
+                        return {foundParentIter->second == chainId, foundParentIter->second};
+                    }
+                }
+                return {false, 0};
+            }
+        };
+        // The main loop responsible for creating tasks and assigning txns to them.
+        // If a continuous chain of transactions is detected, then all txns from such a chain are being assiged to a single task
+        // - txn's priority is taken into account during that process
+        // As an example, the following sequence of chains [ A1, B1, B2, C1, C2, C3, D1, C4, C5 ] will be assigned into:
+        // a) an optimistic split: 5 different tasks (if the same txn priority occurs within the chain)
+        // b) a pessimistic split: 9 different tasks (if a different txn priority occurs, alternately, within the chain)
+        TxValidationPriority chunkInitialPriority = chunkBeginIter->get()->mTxValidationPriority;
+        do {
+            ++chunkEndIter;
+            if (chunkEndIter != vNewTxns.end()) {
+                const auto& result = is_continuous_chain(chainId);
+                if (!result.first || !(chunkInitialPriority == chunkEndIter->get()->mTxValidationPriority)) {
+                    create_task(chunkBeginIter, chunkEndIter, chunkInitialPriority);
+                    chunkBeginIter = chunkEndIter;
+                    chunkInitialPriority = chunkBeginIter->get()->mTxValidationPriority;
+                }
+                // Assign the same id to newly detected txn if it belongs to the known chain, otherwise use a new id.
+                const TxId& txhash = chunkEndIter->get()->mpTx->GetId();
+                if (!result.second) {
+                    mChains.try_emplace(txhash, ++chainId);
+                } else {
+                    mChains.try_emplace(txhash, result.second);
+                }
+            } else {
+                create_task(chunkBeginIter, chunkEndIter, chunkInitialPriority);
+                break;
+            }
+        } while (true);
+        return results;
+    }
 
-    template <typename Callable, typename CallableAfter>
-    void ForEachNodeThen(Callable &&pre, CallableAfter &&post) const {
-        LOCK(cs_vNodes);
-        for (auto &&node : vNodes) {
-            if (NodeFullyConnected(node)) pre(node);
-        }
-        post();
-    };
+    /** Get a handle to our transaction validator */
+    std::shared_ptr<CTxnValidator> getTxnValidator();
+    /** Enqueue a new transaction for validation */
+    void EnqueueTxnForValidator(TxInputDataSPtr pTxInputData);
+    /* Support for a vector */
+    void EnqueueTxnForValidator(std::vector<TxInputDataSPtr> vTxInputData);
+    /** Resubmit a transaction for validation */
+    void ResubmitTxnForValidator(TxInputDataSPtr pTxInputData);
+    /** Check if the given txn is already known by the Validator */
+    bool CheckTxnExistsInValidatorsQueue(const uint256& txHash) const;
+    /* Find node by it's id */
+    CNodePtr FindNodeById(int64_t nodeId);
+    /* Erase transaction from the given peer */
+    void EraseOrphanTxnsFromPeer(NodeId peer);
+    /* Erase transaction by it's hash */
+    int EraseOrphanTxn(const uint256& txHash);
+    /* Check if orphan transaction exists by prevout */
+    bool CheckOrphanTxnExists(const COutPoint& prevout) const;
+    /* Check if orphan transaction exists by txn hash */
+    bool CheckOrphanTxnExists(const uint256& txHash) const;
+    /* Get transaction's hash for orphan transactions (by prevout) */
+    std::vector<uint256> GetOrphanTxnsHash(const COutPoint& prevout) const;
+    /* Check if transaction exists in recent rejects */
+    bool CheckTxnInRecentRejects(const uint256& txHash) const;
+    /* Reset recent rejects */
+    void ResetRecentRejects();
+    /* Get extra txns for block reconstruction */
+    std::vector<std::pair<uint256, CTransactionRef>> GetCompactExtraTxns() const;
 
     // Addrman functions
     size_t GetAddressCount() const;
@@ -284,6 +497,61 @@ public:
 
     void WakeMessageHandler();
 
+    // Task pool for executing async node tasks. Task queue size is implicitly
+    // limited by maximum allowed connections (DEFAULT_MAX_PEER_CONNECTIONS)
+    // times maximum async requests that a node may have active at any given
+    // time.
+    class CAsyncTaskPool
+    {
+    public:
+        CAsyncTaskPool(const Config& config);
+        ~CAsyncTaskPool();
+
+        void AddToPool(
+            const std::shared_ptr<CNode>& node,
+            std::function<void(std::weak_ptr<CNode>)> function,
+            std::shared_ptr<task::CCancellationSource> source);
+
+        bool HasReachedSoftAsyncTaskLimit(NodeId id)
+        {
+            return
+                std::count_if(
+                    mRunningTasks.begin(),
+                    mRunningTasks.end(),
+                    [id](const CRunningTask& container)
+                    {
+                        return container.mId == id;
+                    }) >= mPerInstanceSoftAsyncTaskLimit;
+        }
+
+        /**
+         * Node can be used to execute some code on a different thread to return
+         * control back to CConnman. Each node stores its pending futures that are
+         * removed once the task is done.
+         */
+        void HandleCompletedAsyncProcessing();
+
+    private:
+        struct CRunningTask
+        {
+            CRunningTask(
+                NodeId id,
+                std::future<void>&& future,
+                std::shared_ptr<task::CCancellationSource>&& cancellationSource)
+                : mId{id}
+                , mFuture{std::move(future)}
+                , mCancellationSource{std::move(cancellationSource)}
+            {/**/}
+            NodeId mId;
+            std::future<void> mFuture;
+            std::shared_ptr<task::CCancellationSource> mCancellationSource;
+        };
+
+        CThreadPool<CQueueAdaptor> mPool;
+        std::vector<CRunningTask> mRunningTasks;
+        int mPerInstanceSoftAsyncTaskLimit;
+    };
+
 private:
     struct ListenSocket {
         SOCKET socket;
@@ -303,21 +571,21 @@ private:
 
     uint64_t CalculateKeyedNetGroup(const CAddress &ad) const;
 
-    CNode *FindNode(const CNetAddr &ip);
-    CNode *FindNode(const CSubNet &subNet);
-    CNode *FindNode(const std::string &addrName);
-    CNode *FindNode(const CService &addr);
+    CNodePtr FindNode(const CNetAddr &ip);
+    CNodePtr FindNode(const CSubNet &subNet);
+    CNodePtr FindNode(const std::string &addrName);
+    CNodePtr FindNode(const CService &addr);
 
     bool AttemptToEvictConnection();
-    CNode *ConnectNode(CAddress addrConnect, const char *pszDest,
-                       bool fCountFailure);
+    CNodePtr ConnectNode(CAddress addrConnect, const char *pszDest,
+                         bool fCountFailure);
     bool IsWhitelistedRange(const CNetAddr &addr);
 
-    void DeleteNode(CNode *pnode);
+    void DeleteNode(const CNodePtr& pnode);
 
     NodeId GetNewNodeId();
 
-    size_t SocketSendData(CNode *pnode) const;
+    size_t SocketSendData(const CNodePtr& pnode) const;
     //! check is the banlist has unwritten changes
     bool BannedSetIsDirty();
     //! set the "dirty" flag for the banlist
@@ -333,7 +601,10 @@ private:
     void RecordBytesSent(uint64_t bytes);
 
     // Whether the node should be passed out in ForEach* callbacks
-    static bool NodeFullyConnected(const CNode *pnode);
+    static bool NodeFullyConnected(const CNodePtr& pnode);
+
+    // Peer average bandwidth calculation
+    void PeerAvgBandwithCalc();
 
     const Config *config;
 
@@ -368,8 +639,8 @@ private:
     CCriticalSection cs_vOneShots;
     std::vector<std::string> vAddedNodes;
     CCriticalSection cs_vAddedNodes;
-    std::vector<CNode *> vNodes;
-    std::list<CNode *> vNodesDisconnected;
+    std::vector<CNodePtr> vNodes;
+    std::list<CNodePtr> vNodesDisconnected;
     mutable CCriticalSection cs_vNodes;
     std::atomic<NodeId> nLastNodeId;
 
@@ -379,8 +650,8 @@ private:
     /** Services this instance cares about */
     ServiceFlags nRelevantServices;
 
-    CSemaphore *semOutbound;
-    CSemaphore *semAddnode;
+    std::shared_ptr<CSemaphore> semOutbound {nullptr};
+    std::shared_ptr<CSemaphore> semAddnode {nullptr};
     int nMaxConnections;
     int nMaxOutbound;
     int nMaxAddnode;
@@ -398,6 +669,15 @@ private:
     std::mutex mutexMsgProc;
     std::atomic<bool> flagInterruptMsgProc;
 
+    /** Transaction tracker/propagator */
+    std::shared_ptr<CTxnPropagator> mTxnPropagator {};
+
+    CThreadPool<CQueueAdaptor> mThreadPool { "ConnmanPool" };
+
+    /** Transaction validator */
+    std::shared_ptr<CTxnValidator> mTxnValidator {};
+    CThreadPool<CDualQueueAdaptor> mValidatorThreadPool;
+
     CThreadInterrupt interruptNet;
 
     std::thread threadDNSAddressSeed;
@@ -405,6 +685,11 @@ private:
     std::thread threadOpenAddedConnections;
     std::thread threadOpenConnections;
     std::thread threadMessageHandler;
+
+    std::chrono::milliseconds mDebugP2PTheadStallsThreshold;
+
+    CAsyncTaskPool mAsyncTaskPool;
+    uint8_t mNodeAsyncTaskLimit;
 };
 extern std::unique_ptr<CConnman> g_connman;
 void Discover(boost::thread_group &threadGroup);
@@ -429,15 +714,15 @@ struct CombinerAll {
 
 // Signals for message handling
 struct CNodeSignals {
-    boost::signals2::signal<bool(const Config &, CNode *, CConnman &,
+    boost::signals2::signal<bool(const Config &, const CNodePtr& , CConnman &,
                                  std::atomic<bool> &),
                             CombinerAll>
         ProcessMessages;
-    boost::signals2::signal<bool(const Config &, CNode *, CConnman &,
+    boost::signals2::signal<bool(const Config &, const CNodePtr& , CConnman &,
                                  std::atomic<bool> &),
                             CombinerAll>
         SendMessages;
-    boost::signals2::signal<void(const Config &, CNode *, CConnman &)>
+    boost::signals2::signal<void(const CNodePtr& , CConnman &)>
         InitializeNode;
     boost::signals2::signal<void(NodeId, bool &)> FinalizeNode;
 };
@@ -459,8 +744,8 @@ enum {
     LOCAL_MAX
 };
 
-bool IsPeerAddrLocalGood(CNode *pnode);
-void AdvertiseLocal(CNode *pnode);
+bool IsPeerAddrLocalGood(const CNodePtr& pnode);
+void AdvertiseLocal(const CNodePtr& pnode);
 void SetLimited(enum Network net, bool fLimited = true);
 bool IsLimited(enum Network net);
 bool IsLimited(const CNetAddr &addr);
@@ -479,6 +764,7 @@ extern bool fDiscover;
 extern bool fListen;
 extern bool fRelayTxes;
 
+extern CCriticalSection cs_invQueries;
 extern limitedmap<uint256, int64_t> mapAlreadyAskedFor;
 
 struct LocalServiceInfo {
@@ -499,6 +785,9 @@ public:
     bool fRelayTxes;
     int64_t nLastSend;
     int64_t nLastRecv;
+    bool fPauseSend;
+    bool fPauseRecv;
+    int64_t nSendSize;
     int64_t nTimeConnected;
     int64_t nTimeOffset;
     std::string addrName;
@@ -515,8 +804,12 @@ public:
     double dPingTime;
     double dPingWait;
     double dMinPing;
+    // What this peer sees as my address
     std::string addrLocal;
     CAddress addr;
+    size_t nInvQueueSize;
+    uint64_t nSpotBytesPerSec;
+    uint64_t nMinuteBytesPerSec;
 };
 
 class CNetMessage {
@@ -557,7 +850,7 @@ public:
             return false;
         }
 
-        return (hdr.nMessageSize == nDataPos);
+        return (hdr.nPayloadLength == nDataPos);
     }
 
     const uint256 &GetMessageHash() const;
@@ -571,60 +864,112 @@ public:
     int readData(const char *pch, uint32_t nBytes);
 };
 
+class CSendQueueBytes {
+    // nSendQueueBytes holds data of how many bytes are currently in queue for specific node
+    size_t nSendQueueBytes = 0;
+    // nTotalSendQueuesBytes holds data of how many bytes are currently in all queues across the network (all nodes)
+    static std::atomic_size_t nTotalSendQueuesBytes;
+
+public:
+    ~CSendQueueBytes() {
+        nTotalSendQueuesBytes -= nSendQueueBytes;
+    }
+
+    size_t operator-= (size_t nBytes) {
+        nSendQueueBytes -= nBytes;
+        nTotalSendQueuesBytes -= nBytes;
+        return nSendQueueBytes;
+    }
+
+     size_t operator+= (size_t nBytes) {
+        nSendQueueBytes += nBytes;
+        nTotalSendQueuesBytes += nBytes;
+        return nSendQueueBytes;
+    }
+
+    size_t getSendQueueBytes() const {
+        return nSendQueueBytes;
+    }
+
+    static size_t getTotalSendQueuesBytes() {
+        return nTotalSendQueuesBytes;
+    }
+};
+
 /** Information about a peer */
-class CNode {
+class CNode : public std::enable_shared_from_this<CNode>
+{
     friend class CConnman;
 
 public:
+    /**
+     * Notification structure for SendMessage function that returns:
+     * sendComplete: whether the send was fully complete/partially complete and
+     *               data is needed for sending the rest later.
+     * sentSize: amount of data that was sent.
+     */
+    struct CSendResult
+    {
+        bool sendComplete;
+        size_t sentSize;
+    };
+
     // socket
-    std::atomic<ServiceFlags> nServices;
+    std::atomic<ServiceFlags> nServices {NODE_NONE};
     // Services expected from a peer, otherwise it will be disconnected
-    ServiceFlags nServicesExpected;
-    SOCKET hSocket;
+    ServiceFlags nServicesExpected {NODE_NONE};
+    SOCKET hSocket {0};
     // Total size of all vSendMsg entries.
-    size_t nSendSize;
-    // Offset inside the first vSendMsg already sent.
-    size_t nSendOffset;
-    uint64_t nSendBytes;
-    std::deque<std::vector<uint8_t>> vSendMsg;
-    CCriticalSection cs_vSend;
-    CCriticalSection cs_hSocket;
-    CCriticalSection cs_vRecv;
+    CSendQueueBytes nSendSize;
+    std::deque<std::unique_ptr<CForwardAsyncReadonlyStream>> vSendMsg {};
+    CCriticalSection cs_vSend {};
+    CCriticalSection cs_hSocket {};
+    CCriticalSection cs_vRecv {};
 
-    CCriticalSection cs_vProcessMsg;
-    std::list<CNetMessage> vProcessMsg;
-    size_t nProcessQueueSize;
+    CCriticalSection cs_vProcessMsg {};
+    std::list<CNetMessage> vProcessMsg {};
+    size_t nProcessQueueSize {0};
 
-    CCriticalSection cs_sendProcessing;
+    CCriticalSection cs_sendProcessing {};
 
-    std::deque<CInv> vRecvGetData;
-    uint64_t nRecvBytes;
-    std::atomic<int> nRecvVersion;
+    std::optional<CGetBlockMessageRequest> mGetBlockMessageRequest;
+    std::deque<CInv> vRecvGetData {};
+    uint64_t nRecvBytes {0};
+    std::atomic<int> nRecvVersion {INIT_PROTO_VERSION};
 
-    std::atomic<int64_t> nLastSend;
-    std::atomic<int64_t> nLastRecv;
-    const int64_t nTimeConnected;
-    std::atomic<int64_t> nTimeOffset;
-    const CAddress addr;
-    std::atomic<int> nVersion;
+    /** Average bandwidth measurements */
+    // Keep enough spot measurements to cover 1 minute
+    boost::circular_buffer<double> vAvgBandwidth {60 / PEER_AVG_BANDWIDTH_CALC_FREQUENCY_SECS};
+    // Time we last took a spot measurement
+    int64_t nLastSpotMeasurementTime { GetTimeMicros() };
+    // Bytes received since last spot measurement
+    uint64_t nBytesRecvThisSpot {0};
+
+    std::atomic<int64_t> nLastSend {0};
+    std::atomic<int64_t> nLastRecv {0};
+    const int64_t nTimeConnected {0};
+    std::atomic<int64_t> nTimeOffset {0};
+    // The address of the remote peer
+    const CAddress addr {};
+    std::atomic<int> nVersion {0};
     // strSubVer is whatever byte array we read from the wire. However, this
     // field is intended to be printed out, displayed to humans in various forms
     // and so on. So we sanitize it and store the sanitized version in
     // cleanSubVer. The original should be used when dealing with the network or
     // wire types and the cleaned string used when displayed or logged.
-    std::string strSubVer, cleanSubVer;
+    std::string strSubVer {}, cleanSubVer {};
     // Used for both cleanSubVer and strSubVer.
-    CCriticalSection cs_SubVer;
+    CCriticalSection cs_SubVer {};
     // This peer can bypass DoS banning.
-    bool fWhitelisted;
+    std::atomic_bool fWhitelisted {false};
     // If true this node is being used as a short lived feeler.
-    bool fFeeler;
-    bool fOneShot;
-    bool fAddnode;
-    bool fClient;
-    const bool fInbound;
-    std::atomic_bool fSuccessfullyConnected;
-    std::atomic_bool fDisconnect;
+    bool fFeeler {false};
+    bool fOneShot {false};
+    bool fAddnode {false};
+    bool fClient {false};
+    const bool fInbound {false};
+    std::atomic_bool fSuccessfullyConnected {false};
+    std::atomic_bool fDisconnect {false};
     // We use fRelayTxes for two purposes -
     // a) it allows us to not relay tx invs before receiving the peer's version
     // message.
@@ -632,114 +977,158 @@ public:
     // tx invs unless it loads a bloom filter.
 
     // protected by cs_filter
-    bool fRelayTxes;
-    bool fSentAddr;
-    CSemaphoreGrant grantOutbound;
-    CCriticalSection cs_filter;
-    CBloomFilter *pfilter;
-    std::atomic<int> nRefCount;
-    const NodeId id;
+    bool fRelayTxes {false};
+    bool fSentAddr {false};
+    CSemaphoreGrant grantOutbound {};
+    CCriticalSection cs_filter {};
+    CBloomFilter mFilter;
+    const NodeId id {};
 
-    const uint64_t nKeyedNetGroup;
-    std::atomic_bool fPauseRecv;
-    std::atomic_bool fPauseSend;
+    const uint64_t nKeyedNetGroup {0};
+    std::atomic_bool fPauseRecv {false};
+    std::atomic_bool fPauseSend {false};
 
 protected:
-    mapMsgCmdSize mapSendBytesPerMsgCmd;
-    mapMsgCmdSize mapRecvBytesPerMsgCmd;
+    mapMsgCmdSize mapSendBytesPerMsgCmd {};
+    mapMsgCmdSize mapRecvBytesPerMsgCmd {};
 
 public:
-    uint256 hashContinue;
-    std::atomic<int> nStartingHeight;
+    uint256 hashContinue { uint256() };
+    std::atomic<int> nStartingHeight {-1};
 
     // flood relay
-    std::vector<CAddress> vAddrToSend;
-    CRollingBloomFilter addrKnown;
-    bool fGetAddr;
-    std::set<uint256> setKnown;
-    int64_t nNextAddrSend;
-    int64_t nNextLocalAddrSend;
+    std::vector<CAddress> vAddrToSend {};
+    CRollingBloomFilter addrKnown { 5000, 0.001 };
+    // Has an ADDR been requested?
+    std::atomic_bool fGetAddr {false};
+    int64_t nNextAddrSend {0};
+    int64_t nNextLocalAddrSend {0};
 
     // Inventory based relay.
-    CRollingBloomFilter filterInventoryKnown;
+    CRollingBloomFilter filterInventoryKnown { 50000, 0.000001 };
     // Set of transaction ids we still have to announce. They are sorted by the
     // mempool before relay, so the order is not important.
-    std::set<uint256> setInventoryTxToSend;
+    std::set<uint256> setInventoryTxToSend {};
     // List of block ids we still have announce. There is no final sorting
     // before sending, as they are always sent immediately and in the order
     // requested.
-    std::vector<uint256> vInventoryBlockToSend;
-    CCriticalSection cs_inventory;
-    std::set<uint256> setAskFor;
-    std::multimap<int64_t, CInv> mapAskFor;
-    int64_t nNextInvSend;
+    std::vector<uint256> vInventoryBlockToSend {};
+    CCriticalSection cs_inventory {};
+    std::set<uint256> setAskFor {};
+    std::multimap<int64_t, CInv> mapAskFor {};
+    int64_t nNextInvSend {0};
     // Used for headers announcements - unfiltered blocks to relay. Also
     // protected by cs_inventory.
-    std::vector<uint256> vBlockHashesToAnnounce;
+    std::vector<uint256> vBlockHashesToAnnounce {};
     // Used for BIP35 mempool sending, also protected by cs_inventory.
-    bool fSendMempool;
+    bool fSendMempool {false};
 
     // Last time a "MEMPOOL" request was serviced.
-    std::atomic<int64_t> timeLastMempoolReq;
+    std::atomic<int64_t> timeLastMempoolReq {0};
 
     // Block and TXN accept times
-    std::atomic<int64_t> nLastBlockTime;
-    std::atomic<int64_t> nLastTXTime;
+    std::atomic<int64_t> nLastBlockTime {0};
+    std::atomic<int64_t> nLastTXTime {0};
 
     // Ping time measurement:
     // The pong reply we're expecting, or 0 if no pong expected.
-    std::atomic<uint64_t> nPingNonceSent;
+    std::atomic<uint64_t> nPingNonceSent {0};
     // Time (in usec) the last ping was sent, or 0 if no ping was ever sent.
-    std::atomic<int64_t> nPingUsecStart;
+    std::atomic<int64_t> nPingUsecStart {0};
     // Last measured round-trip time.
-    std::atomic<int64_t> nPingUsecTime;
+    std::atomic<int64_t> nPingUsecTime {0};
     // Best measured round-trip time.
-    std::atomic<int64_t> nMinPingUsecTime;
+    std::atomic<int64_t> nMinPingUsecTime { std::numeric_limits<int64_t>::max() };
     // Whether a ping is requested.
-    std::atomic<bool> fPingQueued;
+    std::atomic_bool fPingQueued {false};
     // Minimum fee rate with which to filter inv's to this node
-    Amount minFeeFilter;
-    CCriticalSection cs_feeFilter;
-    Amount lastSentFeeFilter;
-    int64_t nextSendTimeFeeFilter;
+    Amount minFeeFilter {0};
+    CCriticalSection cs_feeFilter {};
+    Amount lastSentFeeFilter {0};
+    int64_t nextSendTimeFeeFilter {0};
 
-    CNode(NodeId id, ServiceFlags nLocalServicesIn, int nMyStartingHeightIn,
-          SOCKET hSocketIn, const CAddress &addrIn, uint64_t nKeyedNetGroupIn,
-          uint64_t nLocalHostNonceIn, const std::string &addrNameIn = "",
-          bool fInboundIn = false);
+    /** Maximum number of CInv elements this peers is willing to accept */
+    uint32_t maxInvElements {CInv::estimateMaxInvElements(LEGACY_MAX_PROTOCOL_PAYLOAD_LENGTH)};
+    /** protoconfReceived is false by default and set to true when protoconf is received from peer **/
+    bool protoconfReceived {false};
+
+    /** Constructor for producing CNode shared pointer instances */
+    template<typename ... Args>
+    static std::shared_ptr<CNode> Make(Args&& ... args)
+    {
+        return std::shared_ptr<CNode>(new CNode{std::forward<Args>(args)...});
+    }
+
     ~CNode();
 
+    CNode(CNode&&) = delete;
+    CNode& operator=(CNode&&) = delete;
+    CNode(const CNode&) = delete;
+    CNode& operator=(const CNode&) = delete;
+
 private:
-    CNode(const CNode &);
-    void operator=(const CNode &);
+    CNode(
+        NodeId id,
+        ServiceFlags nLocalServicesIn,
+        int nMyStartingHeightIn,
+        SOCKET hSocketIn,
+        const CAddress& addrIn,
+        uint64_t nKeyedNetGroupIn,
+        uint64_t nLocalHostNonceIn,
+        CConnman::CAsyncTaskPool& asyncTaskPool,
+        const std::string &addrNameIn = "",
+        bool fInboundIn = false);
 
-    const uint64_t nLocalHostNonce;
+    /**
+     * Storage for the last chunk being sent to the peer. This variable contains
+     * data for the duration of sending the chunk. Once the chunk is sent it is
+     * cleared.
+     * In case there is an interruption during sending (sent size exceeded or
+     * network layer can not process any more data at the moment) this variable
+     * remains set and is used to continue streaming on the next try.
+     */
+    std::optional<CSpan> mSendChunk;
+    uint64_t nSendBytes {0};
+
+    const uint64_t nLocalHostNonce {};
     // Services offered to this peer
-    const ServiceFlags nLocalServices;
-    const int nMyStartingHeight;
-    int nSendVersion;
+    const ServiceFlags nLocalServices {};
+    const int nMyStartingHeight {};
+    int nSendVersion {0};
     // Used only by SocketHandler thread.
-    std::list<CNetMessage> vRecvMsg;
+    std::list<CNetMessage> vRecvMsg {};
 
-    mutable CCriticalSection cs_addrName;
-    std::string addrName;
+    mutable CCriticalSection cs_addrName {};
+    std::string addrName {};
 
-    CService addrLocal;
-    mutable CCriticalSection cs_addrLocal;
+    CService addrLocal {};
+    mutable CCriticalSection cs_addrLocal {};
+
+    /** Deque of inventory msgs for transactions to send */
+    std::deque<CTxnSendingDetails> mInvList;
+    CCriticalSection cs_mInvList {};
+
+    CConnman::CAsyncTaskPool& mAsyncTaskPool;
 
 public:
     enum RECV_STATUS {RECV_OK, RECV_BAD_LENGTH, RECV_FAIL};
+
+    CSendResult SendMessage(
+        CForwardAsyncReadonlyStream& data,
+        size_t maxChunkSize);
+
+    /** Add some new transactions to our pending inventory list */
+    void AddTxnsToInventory(const std::vector<CTxnSendingDetails>& txns);
+    /** Remove some transactions from our pending inventroy list */
+    void RemoveTxnsFromInventory(const std::vector<CTxnSendingDetails>& txns);
+    /** Fetch the next N items from our inventory */
+    std::vector<CTxnSendingDetails> FetchNInventory(size_t n);
 
     NodeId GetId() const { return id; }
 
     uint64_t GetLocalNonce() const { return nLocalHostNonce; }
 
     int GetMyStartingHeight() const { return nMyStartingHeight; }
-
-    int GetRefCount() {
-        assert(nRefCount >= 0);
-        return nRefCount;
-    }
 
     RECV_STATUS ReceiveMsgBytes(const Config &config, const char *pch, uint32_t nBytes,
                          bool &complete);
@@ -752,13 +1141,6 @@ public:
     CService GetAddrLocal() const;
     //! May not be called more than once
     void SetAddrLocal(const CService &addrLocalIn);
-
-    CNode *AddRef() {
-        nRefCount++;
-        return this;
-    }
-
-    void Release() { nRefCount--; }
 
     void AddAddressKnown(const CAddress &_addr) {
         addrKnown.insert(_addr.GetKey());
@@ -805,11 +1187,40 @@ public:
 
     void copyStats(CNodeStats &stats);
 
+    uint64_t GetAverageBandwidth();
+
     ServiceFlags GetLocalServices() const { return nLocalServices; }
 
     std::string GetAddrName() const;
     //! Sets the addrName only if it was not previously set
     void MaybeSetAddrName(const std::string &addrNameIn);
+
+    /**
+     * Run node related task asynchronously.
+     * Tasks may live longer than CNode instance exists as they are gracefully
+     * terminated before completion only when CConnman instance is terminated
+     * (CConnman destructor implicitly calls CAsyncTaskPool destructor which
+     * terminates the tasks).
+     *
+     * The reason for task lifetime extension past CNode lifetime is that the
+     * network connection can be dropped which destroys CNode instance while
+     * on the other hand tasks should not be bound to this external event - for
+     * example current tasks call ActivateBestChain() which should finish even
+     * if connection is dropped (not related to a specific node).
+     *
+     * NOTE: Function should never capture bare pointer or shared pointer
+     *       reference to this node internally as that can lead to unwanted
+     *       lifetime extension (tasks may run longer than node is kept alive).
+     *       For this reason the weak pointer that is provided as call parameter
+     *       should be used instead.
+     *       In current tasks the weak pointer is used only for updating
+     *       CNode::nLastBlockTime which is relevant only while node instance
+     *       exists and has no side effects when we can't perform it after the
+     *       node instance no longer exists.
+     */
+    void RunAsyncProcessing(
+        std::function<void(std::weak_ptr<CNode>)> function,
+        std::shared_ptr<task::CCancellationSource> source);
 };
 
 /**
@@ -818,6 +1229,5 @@ public:
  */
 int64_t PoissonNextSend(int64_t nNow, int average_interval_seconds);
 
-std::string getSubVersionEB(uint64_t MaxBlockSize);
-std::string userAgent(const Config &config);
+std::string userAgent();
 #endif // BITCOIN_NET_H

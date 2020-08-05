@@ -1,19 +1,28 @@
 # Copyright (c) 2017 The Bitcoin developers
+# Copyright (c) 2019 Bitcoin Association
+# Distributed under the Open BSV software license, see the accompanying file LICENSE.
 
 cmake_minimum_required(VERSION 3.5)
 project(BitcoinSV)
 
-set(CMAKE_CXX_STANDARD 11)
+set(CMAKE_CXX_STANDARD 17)
 
 # Default visibility is hidden on all targets.
 set(CMAKE_C_VISIBILITY_PRESET hidden)
 set(CMAKE_CXX_VISIBILITY_PRESET hidden)
 
+option(ENABLE_PROD_BUILD "Enable production build" OFF)
 option(BUILD_BITCOIN_WALLET "Activate the wallet functionality" ON)
 option(BUILD_BITCOIN_ZMQ "Activate the ZeroMQ functionalities" ON)
-option(BUILD_BITCOIN_SEEDER "Build bitcoin-seeder" ON)
+
+if (NOT MSVC)
+  #bitcoin seeder can not be build with MSVC
+	option(BUILD_BITCOIN_SEEDER "Build bitcoin-seeder" ON)
+endif()
+
 option(BUILD_BITCOIN_CLI "Build bitcoin-cli" ON)
 option(BUILD_BITCOIN_TX "Build bitcoin-tx" ON)
+option(BUILD_BITCOIN_MINER "Build bitcoin-miner" ON)
 option(BUILD_BITCOIN_BENCH "Build benchmarks" ON)
 
 # Ensure that WINDRES_PREPROC is enabled when using windres.
@@ -42,6 +51,38 @@ if(EXTRA_WARNINGS)
 else()
 	add_compiler_flag(-Wno-unused-parameter)
 endif()
+
+if(MSVC)
+	# Do not define min/max macros - we use std::min/max
+	add_compile_definitions(NOMINMAX)
+	# Perform parallel builds:
+	add_compile_options("/MP")
+
+	# Fix Cmake's default compiler options - see also https://gitlab.kitware.com/cmake/community/wikis/FAQ#dynamic-replace
+	# - remove default NDEBUG compile definition to solve #error "Bitcoin cannot be compiled without assertions"
+	# - use static runtime instead of dynamic runtime to match the external libraries  
+	foreach(flag_var
+		CMAKE_CXX_FLAGS CMAKE_CXX_FLAGS_DEBUG CMAKE_CXX_FLAGS_RELEASE
+		CMAKE_CXX_FLAGS_MINSIZEREL CMAKE_CXX_FLAGS_RELWITHDEBINFO
+		CMAKE_C_FLAGS CMAKE_C_FLAGS_DEBUG CMAKE_C_FLAGS_RELEASE
+		CMAKE_C_FLAGS_MINSIZEREL CMAKE_C_FLAGS_RELWITHDEBINFO)
+		
+	if(${flag_var} MATCHES "/MD")
+			string(REGEX REPLACE "/MD" "/MT" ${flag_var} "${${flag_var}}")    
+		endif()
+
+		if(${flag_var} MATCHES "/DNDEBUG")
+			string(REGEX REPLACE "/DNDEBUG" "" ${flag_var} "${${flag_var}}")
+		endif()
+
+	endforeach()
+
+endif()
+
+# openssl library
+include(BrewHelper)
+find_brew_prefix(OPENSSL_ROOT_DIR openssl)
+find_package(OpenSSL REQUIRED)
 
 # libtool style configure
 add_subdirectory(config)
@@ -73,6 +114,7 @@ add_library(util
 	support/lockedpool.cpp
 	sync.cpp
 	threadinterrupt.cpp
+	threadpriority.cpp
 	uint256.cpp
 	util.cpp
 	utilmoneystr.cpp
@@ -80,6 +122,9 @@ add_library(util
 	utiltime.cpp
 )
 
+if(ENABLE_PROD_BUILD)
+    target_compile_definitions(util PUBLIC IS_PRODUCTION_BUILD)
+endif()
 target_compile_definitions(util PUBLIC HAVE_CONFIG_H)
 target_include_directories(util
 	PUBLIC
@@ -118,7 +163,7 @@ endfunction(prepend)
 
 prepend(BOOST_LIBRARIES "Boost::" ${BOOST_PACKAGES_REQUIRED})
 
-find_package(Boost 1.58 REQUIRED ${BOOST_PACKAGES_REQUIRED})
+find_package(Boost 1.59 REQUIRED ${BOOST_PACKAGES_REQUIRED})
 target_link_libraries(util univalue crypto ${BOOST_LIBRARIES})
 
 # Make sure boost uses std::atomic (it doesn't before 1.63)
@@ -129,8 +174,6 @@ target_compile_definitions(util PUBLIC BOOST_SP_USE_STD_ATOMIC BOOST_AC_USE_STD_
 add_library(common
 	amount.cpp
 	base58.cpp
-	cashaddr.cpp
-	cashaddrenc.cpp
 	chainparams.cpp
 	config.cpp
 	consensus/merkle.cpp
@@ -145,6 +188,7 @@ add_library(common
 	netbase.cpp
 	primitives/block.cpp
 	protocol.cpp
+	rpc/jsonwriter.cpp
 	scheduler.cpp
 	script/sign.cpp
 	script/standard.cpp
@@ -156,18 +200,25 @@ target_link_libraries(common util secp256k1)
 # libbitcoinconsensus
 add_library(bitcoinconsensus
 	arith_uint256.cpp
+    big_int.cpp
 	hash.cpp
 	primitives/transaction.cpp
 	pubkey.cpp
 	script/bitcoinconsensus.cpp
 	script/interpreter.cpp
+	script/limitedstack.cpp
 	script/script.cpp
+	script/script_num.cpp
 	script/script_error.cpp
 	uint256.cpp
 	utilstrencodings.cpp
 )
 
 target_link_libraries(bitcoinconsensus common)
+target_include_directories(bitcoinconsensus
+	PRIVATE
+		${OPENSSL_INCLUDE_DIR}
+)
 
 # Bitcoin server facilities
 add_library(server
@@ -175,6 +226,7 @@ add_library(server
 	addrdb.cpp
 	bloom.cpp
 	blockencodings.cpp
+	blockfileinfostore.cpp
 	chain.cpp
 	checkpoints.cpp
 	config.cpp
@@ -183,10 +235,18 @@ add_library(server
 	init.cpp
 	dbwrapper.cpp
 	merkleblock.cpp
-	miner.cpp
+	mining/assembler.cpp
+	mining/candidates.cpp
+	mining/factory.cpp
+	mining/journal.cpp
+	mining/journal_builder.cpp
+	mining/journal_change_set.cpp
+	mining/journaling_block_assembler.cpp
+    mining/legacy.cpp
 	net.cpp
 	net_processing.cpp
 	noui.cpp
+	orphan_txns.cpp
 	policy/fees.cpp
 	policy/policy.cpp
 	pow.cpp
@@ -194,6 +254,7 @@ add_library(server
 	rpc/abc.cpp
 	rpc/blockchain.cpp
 	rpc/mining.cpp
+	rpc/mining-fbb.cpp
 	rpc/misc.cpp
 	rpc/net.cpp
 	rpc/rawtransaction.cpp
@@ -202,13 +263,20 @@ add_library(server
 	script/sigcache.cpp
 	script/ismine.cpp
 	timedata.cpp
+    time_locked_mempool.cpp
 	torcontrol.cpp
 	txdb.cpp
 	txmempool.cpp
+    tx_mempool_info.cpp
+	txn_double_spend_detector.cpp
+	txn_propagator.cpp
+	txn_validation_data.cpp
+	txn_validator.cpp
+	txn_recent_rejects.cpp
 	ui_interface.cpp
 	validation.cpp
 	validationinterface.cpp
-	versionbits.cpp
+    vmtouch.cpp
 )
 
 # This require libevent
@@ -229,6 +297,10 @@ target_link_libraries(server
 
 if(NOT ${CMAKE_SYSTEM_NAME} MATCHES "Windows")
 	target_link_libraries(server ${EVENT_PTHREAD_LIBRARY})
+else()
+  # New mining API uses boost uuid library which requires bcrypt.lib on Windows
+  find_library(BCRYPT_LIBRARY NAMES bcrypt)
+  target_link_libraries(server ${BCRYPT_LIBRARY})
 endif()
 
 # Test suite.
@@ -281,9 +353,28 @@ if(BUILD_BITCOIN_TX)
 	target_link_libraries(bitcoin-tx bitcoinconsensus)
 endif()
 
+# bitcoin-miner
+if(BUILD_BITCOIN_MINER)
+	add_executable(bitcoin-miner bitcoin-miner.cpp)
+	target_include_directories(bitcoin-miner PRIVATE ${EVENT_INCLUDE_DIR})
+	target_link_libraries(bitcoin-miner common rpcclient bitcoinconsensus ${EVENT_LIBRARY})
+endif()
+
 # bitcoind
 add_executable(bitcoind bitcoind.cpp)
-target_link_libraries(bitcoind server)
+target_link_libraries(
+	bitcoind
+	server
+	$<$<PLATFORM_ID:Linux>:rt>) # use librt.so for aio on Linux
 if(${CMAKE_SYSTEM_NAME} MATCHES "Windows")
 	target_sources(bitcoind PRIVATE bitcoind-res.rc)
+endif()
+
+if (MSVC)
+	# prevents default build from running unit tests automaticaly
+	set_target_properties(check-bitcoin PROPERTIES EXCLUDE_FROM_DEFAULT_BUILD TRUE)
+	set_target_properties(check-leveldb PROPERTIES EXCLUDE_FROM_DEFAULT_BUILD TRUE)
+	set_target_properties(check-secp256k1 PROPERTIES EXCLUDE_FROM_DEFAULT_BUILD TRUE)
+	set_target_properties(check-univalue PROPERTIES EXCLUDE_FROM_DEFAULT_BUILD TRUE)
+	set_target_properties(check-all PROPERTIES EXCLUDE_FROM_DEFAULT_BUILD TRUE)
 endif()

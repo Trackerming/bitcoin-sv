@@ -1,6 +1,6 @@
 // Copyright (c) 2012-2016 The Bitcoin Core developers
-// Distributed under the MIT software license, see the accompanying
-// file COPYING or http://www.opensource.org/licenses/mit-license.php.
+// Copyright (c) 2019 Bitcoin Association
+// Distributed under the Open BSV software license, see the accompanying file LICENSE.
 
 #include "bloom.h"
 
@@ -20,6 +20,17 @@
 
 #include <boost/test/unit_test.hpp>
 #include <boost/tuple/tuple.hpp>
+
+static bool inValidConstructorParameterException(const std::runtime_error &ex) {
+    std::runtime_error expectedException(
+        "Error: Invalid Parameter nFPRate passed to constructor");
+
+    // The string returned by what() can be different for different platforms.
+    // Instead of directly comparing the ex.what() with an expected string,
+    // create an instance of exception to see if ex.what() matches  the expected
+    // explanatory string returned by the exception instance.
+    return strcmp(expectedException.what(), ex.what()) == 0;
+}
 
 BOOST_FIXTURE_TEST_SUITE(bloom_tests, BasicTestingSetup)
 
@@ -64,6 +75,9 @@ BOOST_AUTO_TEST_CASE(bloom_create_insert_serialize) {
     BOOST_CHECK_MESSAGE(
         !filter.contains(ParseHex("99108ad8ed9bb6274d3980bab5a85c048f0950c8")),
         "Bloom filter should be empty!");
+
+    BOOST_CHECK_EXCEPTION(CBloomFilter filter(3, 0.0, 0, BLOOM_UPDATE_ALL), std::runtime_error,inValidConstructorParameterException);
+    BOOST_CHECK_EXCEPTION(CBloomFilter filter(3, 1.181, 0, BLOOM_UPDATE_ALL), std::runtime_error,inValidConstructorParameterException);
 }
 
 BOOST_AUTO_TEST_CASE(bloom_create_insert_serialize_with_tweak) {
@@ -128,6 +142,31 @@ BOOST_AUTO_TEST_CASE(bloom_create_insert_key) {
 
     BOOST_CHECK_EQUAL_COLLECTIONS(stream.begin(), stream.end(),
                                   expected.begin(), expected.end());
+}
+
+BOOST_AUTO_TEST_CASE(bloom_filter_limits)
+{
+    std::vector<uint8_t> data(MAX_SCRIPT_ELEMENT_SIZE_BEFORE_GENESIS, 0xab);
+
+    CBloomFilter filterWithShortData;
+    // streamWithShortData represents filter with inserted vector std::vector<uint8_t> data(MAX_SCRIPT_ELEMENT_SIZE_BEFORE_GENESIS, 0xab)
+    // Insert method does not insert data longer than MAX_SCRIPT_ELEMENT_SIZE_BEFORE_GENESIS bytes.
+    // We could not test contains method if insert would fail.
+    CDataStream streamWithShortData(
+        ParseHex("2300080000000000000121200004400001020400100200000400000000100000a000000c130000000000000001"),
+        SER_NETWORK, PROTOCOL_VERSION);
+    streamWithShortData >> filterWithShortData;
+    BOOST_CHECK(filterWithShortData.contains(data));
+
+    CBloomFilter filterWithLongData;
+    // streamWithLongData represents filter with inserted vector std::vector<uint8_t> data(MAX_SCRIPT_ELEMENT_SIZE_BEFORE_GENESIS + 1, 0xab)
+    CDataStream streamWithLongData(
+        ParseHex("232020000080000100088000800000000008000804000000880002000800820028000080130000000000000001"),
+        SER_NETWORK, PROTOCOL_VERSION);
+    streamWithLongData >> filterWithLongData;
+    data.push_back(0xab);
+    // Contains method returns false if data.size() > MAX_SCRIPT_ELEMENT_SIZE_BEFORE_GENESIS.
+    BOOST_CHECK(!filterWithLongData.contains(data));
 }
 
 BOOST_AUTO_TEST_CASE(bloom_match) {
@@ -1125,6 +1164,9 @@ BOOST_AUTO_TEST_CASE(rolling_bloom) {
     for (int i = 0; i < DATASIZE; i++) {
         BOOST_CHECK(rb2.contains(data[i]));
     }
+
+    BOOST_CHECK_EXCEPTION(CRollingBloomFilter filter(3, 0.0), std::runtime_error,inValidConstructorParameterException);
+    BOOST_CHECK_EXCEPTION(CRollingBloomFilter filter(3, 1.181), std::runtime_error,inValidConstructorParameterException);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

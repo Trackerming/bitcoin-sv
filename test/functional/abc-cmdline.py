@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Copyright (c) 2017 The Bitcoin developers
-# Distributed under the MIT software license, see the accompanying
-# file COPYING or http://www.opensource.org/licenses/mit-license.php.
+# Copyright (c) 2019 Bitcoin Association
+# Distributed under the Open BSV software license, see the accompanying file LICENSE.
 """
 Exercise the command line functions specific to ABC functionality.
 Currently:
@@ -9,13 +9,9 @@ Currently:
 -excessiveblocksize=<blocksize_in_bytes>
 """
 
-import re
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import assert_equal
-from test_framework.cdefs import LEGACY_MAX_BLOCK_SIZE, DEFAULT_MAX_BLOCK_SIZE, LEGACY_DEFAULT_MAX_BLOCK_SIZE
-
-MAX_GENERATED_BLOCK_SIZE_ERROR = (
-    'Max generated block size (blockmaxsize) cannot exceed the excessive block size (excessiveblocksize)')
+from test_framework.cdefs import LEGACY_MAX_BLOCK_SIZE, UINT32_MAX, ONE_MEGABYTE
 
 
 class ABC_CmdLine_Test (BitcoinTestFramework):
@@ -30,42 +26,17 @@ class ABC_CmdLine_Test (BitcoinTestFramework):
         ebs = getsize['excessiveBlockSize']
         assert_equal(ebs, expected_value)
 
-    def check_subversion(self, pattern_str):
-        'Check that the subversion is set as expected'
-        netinfo = self.nodes[0].getnetworkinfo()
-        subversion = netinfo['subversion']
-        pattern = re.compile(pattern_str)
-        assert(pattern.match(subversion))
-
     def excessiveblocksize_test(self):
         self.log.info("Testing -excessiveblocksize")
 
-        # Can't test an excessiveblocksize > than the block file size limit
-        #self.log.info("  Set to twice the default, i.e. %d bytes" %
-        #              (2 * DEFAULT_MAX_BLOCK_SIZE))
-        #self.stop_node(0)
-        #self.start_node(0, ["-excessiveblocksize=%d" %
-        #                    (2 * DEFAULT_MAX_BLOCK_SIZE)])
-        #self.check_excessive(2 * DEFAULT_MAX_BLOCK_SIZE)
-        ## Check for EB correctness in the subver string
-        #self.check_subversion("/Bitcoin SV:.*\(EB64\.0; .*\)/")
-
-        excessive = 2 * LEGACY_DEFAULT_MAX_BLOCK_SIZE;
-        self.log.info("  Set to twice the legacy default, i.e. %d bytes" % excessive)
+        self.log.info("  Set to larger than the default, i.e. %d bytes" % (UINT32_MAX + 6000000))
         self.stop_node(0)
-        self.start_node(0, ["-excessiveblocksize=%d" % excessive])
-        self.check_excessive(excessive)
-        # Check for EB correctness in the subver string
-        self.check_subversion("/Bitcoin SV:.*\(EB64\.0; .*\)/")
+        self.start_node(0, ["-excessiveblocksize=%d" % (UINT32_MAX + 6000000)])
+        self.check_excessive(UINT32_MAX + 6000000)
 
-        self.log.info("  Attempt to set below legacy limit of 1MB - try %d bytes" %
-                      LEGACY_MAX_BLOCK_SIZE)
+        self.log.info("  Attempt to set below legacy limit of 1MB - try %d bytes" % LEGACY_MAX_BLOCK_SIZE)
         self.stop_node(0)
-        self.assert_start_raises_init_error(
-            0, ["-excessiveblocksize=%d" % LEGACY_MAX_BLOCK_SIZE], 'Error:')
-        self.log.info("  Attempt to set below blockmaxsize (mining limit)")
-        self.assert_start_raises_init_error(
-            0, ['-blockmaxsize=1500000', '-excessiveblocksize=1300000'], 'Error: ' + MAX_GENERATED_BLOCK_SIZE_ERROR)
+        self.assert_start_raises_init_error(0, ["-excessiveblocksize=%d" % LEGACY_MAX_BLOCK_SIZE], 'Error:')
 
         # Make sure we leave the test with a node running as this is what thee
         # framework expects.

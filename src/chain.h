@@ -12,7 +12,11 @@
 #include "primitives/block.h"
 #include "tinyformat.h"
 #include "uint256.h"
+#include "logging.h"
 
+#include <atomic>
+#include <chrono>
+#include <shared_mutex>
 #include <unordered_map>
 #include <vector>
 
@@ -34,10 +38,6 @@ class CBlockFileInfo {
 public:
     //!< number of blocks stored in file
     unsigned int nBlocks;
-    //!< number of used bytes of block file
-    unsigned int nSize;
-    //!< number of used bytes in the undo file
-    unsigned int nUndoSize;
     //!< lowest height of block in file
     unsigned int nHeightFirst;
     //!< highest height of block in file
@@ -46,28 +46,73 @@ public:
     uint64_t nTimeFirst;
     //!< latest time of block in file
     uint64_t nTimeLast;
+    //!< number of used bytes of block file
+    uint64_t nSize;
+    //!< number of used bytes in the undo file
+    uint64_t nUndoSize;
 
     ADD_SERIALIZE_METHODS;
 
     template <typename Stream, typename Operation>
-    inline void SerializationOp(Stream &s, Operation ser_action) {
+    inline void SerializationOp(Stream &s, Operation ser_action) 
+    {
+        // Legacy 32 bit sizes used for reading and writing. 
+        // When writing size larger or equal than max 32 bit value, 
+        // max 32 bit value (0xFFFFFFFF) is written in 32 bit field 
+        // and actual size is written in separate 64 bit field. 
+        // When reading, separate 64 bit value should be read when 32 bit value
+        // is max (0xFFFFFFFF).
+        unsigned int nSizeLegacy; 
+        unsigned int nUndoSizeLegacy;
+        if (nSize >= std::numeric_limits<uint32_t>::max())
+        {
+            nSizeLegacy = std::numeric_limits<uint32_t>::max();
+        }
+        else
+        {
+            nSizeLegacy = static_cast<uint32_t>(nSize);
+        }
+        if (nUndoSize >= std::numeric_limits<uint32_t>::max())
+        {
+            nUndoSizeLegacy = std::numeric_limits<uint32_t>::max();
+        }
+        else
+        {
+            nUndoSizeLegacy = static_cast<uint32_t>(nUndoSize);
+        }
         READWRITE(VARINT(nBlocks));
-        READWRITE(VARINT(nSize));
-        READWRITE(VARINT(nUndoSize));
+        READWRITE(VARINT(nSizeLegacy));
+        READWRITE(VARINT(nUndoSizeLegacy));
         READWRITE(VARINT(nHeightFirst));
         READWRITE(VARINT(nHeightLast));
         READWRITE(VARINT(nTimeFirst));
         READWRITE(VARINT(nTimeLast));
+        if (nSizeLegacy == std::numeric_limits<uint32_t>::max())
+        {
+            READWRITE(VARINT(nSize));
+        }
+        else
+        {
+            nSize = nSizeLegacy;
+        }
+        if (nUndoSize == std::numeric_limits<uint32_t>::max())
+        {
+            READWRITE(VARINT(nUndoSize));
+        }
+        else
+        {
+            nUndoSize = nUndoSizeLegacy;
+        }
     }
 
     void SetNull() {
         nBlocks = 0;
-        nSize = 0;
-        nUndoSize = 0;
         nHeightFirst = 0;
         nHeightLast = 0;
         nTimeFirst = 0;
         nTimeLast = 0;
+        nSize = 0;
+        nUndoSize = 0;
     }
 
     CBlockFileInfo() { SetNull(); }
@@ -188,6 +233,9 @@ private:
     // The block has an invalid parent.
     static const uint32_t FAILED_PARENT_FLAG = 0x40;
 
+    // The block disk file hash and content size are set.
+    static const uint32_t HAS_DISK_BLOCK_META_DATA_FLAG = 0x80;
+
     // Mask used to check if the block failed.
     static const uint32_t INVALID_MASK = FAILED_FLAG | FAILED_PARENT_FLAG;
 
@@ -220,6 +268,16 @@ public:
                            (hasFailed ? FAILED_FLAG : 0));
     }
 
+    bool hasDiskBlockMetaData() const
+    {
+        return status & HAS_DISK_BLOCK_META_DATA_FLAG;
+    }
+    BlockStatus withDiskBlockMetaData(bool hasData = true) const
+    {
+        return BlockStatus((status & ~HAS_DISK_BLOCK_META_DATA_FLAG) |
+                           (hasData ? HAS_DISK_BLOCK_META_DATA_FLAG : 0));
+    }
+
     bool hasFailedParent() const { return status & FAILED_PARENT_FLAG; }
     BlockStatus withFailedParent(bool hasFailedParent = true) const {
         return BlockStatus((status & ~FAILED_PARENT_FLAG) |
@@ -250,6 +308,26 @@ public:
         READWRITE(VARINT(status));
     }
 };
+
+/**
+ * Structure for storing hash of the block data on disk and its size.
+ */
+struct CDiskBlockMetaData
+{
+    uint256 diskDataHash;
+    uint64_t diskDataSize = 0;
+
+    ADD_SERIALIZE_METHODS;
+
+    template <typename Stream, typename Operation>
+    inline void SerializationOp(Stream &s, Operation ser_action)
+    {
+        READWRITE(diskDataHash);
+        READWRITE(diskDataSize);
+    }
+};
+
+arith_uint256 GetBlockProof(const CBlockIndex &block);
 
 /**
  * The block chain is a tree shaped structure starting with the genesis block at
@@ -338,6 +416,11 @@ public:
         nTimeReceived = 0;
         nBits = 0;
         nNonce = 0;
+        mDiskBlockMetaData = {};
+
+        // set to maximum time by default to indicate that validation has not
+        // yet been completed
+        mValidationCompletionTime = SteadyClockTimePoint::max();
     }
 
     CBlockIndex() { SetNull(); }
@@ -357,6 +440,24 @@ public:
         nNonce = block.nNonce;
     }
 
+    void LoadFromPersistentData(const CBlockIndex& other, CBlockIndex* previous)
+    {
+        pprev = previous;
+        nHeight = other.nHeight;
+        nFile = other.nFile;
+        nDataPos = other.nDataPos;
+        nUndoPos = other.nUndoPos;
+        nVersion = other.nVersion;
+        hashMerkleRoot = other.hashMerkleRoot;
+        nTime = other.nTime;
+        nBits = other.nBits;
+        nNonce = other.nNonce;
+        nStatus = other.nStatus;
+        nTx = other.nTx;
+        mDiskBlockMetaData = other.mDiskBlockMetaData;
+        mValidationCompletionTime = other.mValidationCompletionTime;
+    }
+
     CDiskBlockPos GetBlockPos() const {
         CDiskBlockPos ret;
         if (nStatus.hasData()) {
@@ -373,6 +474,56 @@ public:
             ret.nPos = nUndoPos;
         }
         return ret;
+    }
+
+    CDiskBlockMetaData GetDiskBlockMetaData() const {return mDiskBlockMetaData;}
+    void SetDiskBlockMetaData(const uint256& hash, size_t size)
+    {
+        assert(!hash.IsNull());
+        assert(size > 0);
+
+        mDiskBlockMetaData = {hash, size};
+        nStatus = nStatus.withDiskBlockMetaData();
+    }
+
+    void SetDiskBlockData(
+        size_t transactionsCount,
+        const CDiskBlockPos& pos,
+        CDiskBlockMetaData metaData)
+    {
+        nTx = transactionsCount;
+        nChainTx = 0;
+        nFile = pos.nFile;
+        nDataPos = pos.nPos;
+        nUndoPos = 0;
+        nStatus = nStatus.withData();
+        RaiseValidity(BlockValidity::TRANSACTIONS);
+
+        if (!metaData.diskDataHash.IsNull() && metaData.diskDataSize)
+        {
+            mDiskBlockMetaData = std::move(metaData);
+            nStatus = nStatus.withDiskBlockMetaData();
+        }
+    }
+
+    void SetChainWork()
+    {
+        nChainWork =
+            (pprev ? pprev->nChainWork : 0) +
+            GetBlockProof(*this);
+    }
+
+    void ClearFileInfo()
+    {
+        nStatus =
+            nStatus
+                .withData(false)
+                .withUndo(false)
+                .withDiskBlockMetaData(false);
+        nFile = 0;
+        nDataPos = 0;
+        nUndoPos = 0;
+        mDiskBlockMetaData = {};
     }
 
     CBlockHeader GetBlockHeader() const {
@@ -394,23 +545,47 @@ public:
 
     int64_t GetBlockTimeMax() const { return int64_t(nTimeMax); }
 
-    int64_t GetHeaderTimeReceived() const { return nTimeReceived; }
+    int64_t GetHeaderReceivedTime() const { return nTimeReceived; }
+
+    int64_t GetReceivedTimeDiff() const {
+        return GetHeaderReceivedTime() - GetBlockTime();
+    }
 
     enum { nMedianTimeSpan = 11 };
 
-    int64_t GetMedianTimePast() const {
-        int64_t pmedian[nMedianTimeSpan];
-        int64_t *pbegin = &pmedian[nMedianTimeSpan];
-        int64_t *pend = &pmedian[nMedianTimeSpan];
+    int64_t GetMedianTimePast() const
+    {
+        std::vector<int64_t> block_times;
 
-        const CBlockIndex *pindex = this;
-        for (int i = 0; i < nMedianTimeSpan && pindex;
-             i++, pindex = pindex->pprev) {
-            *(--pbegin) = pindex->GetBlockTime();
+        const CBlockIndex* pindex = this;
+        for(int i{}; i < nMedianTimeSpan && pindex; i++, pindex = pindex->pprev)
+        {
+            block_times.push_back(pindex->GetBlockTime());
         }
 
-        std::sort(pbegin, pend);
-        return pbegin[(pend - pbegin) / 2];
+        const auto n{block_times.size() / 2};
+        std::nth_element(begin(block_times), begin(block_times) + n,
+                         end(block_times));
+        return block_times[n];
+    }
+
+    /**
+     * Pretend that validation to SCRIPT level was instantanious. This is used
+     * for precious blocks where we wish to treat a certain block as if it was
+     * the first block with a certain amount of work.
+     */
+    void IgnoreValidationTime()
+    {
+        mValidationCompletionTime = SteadyClockTimePoint::min();
+    }
+
+    /**
+     * Get tie breaker time for checking which of the blocks with same amount of
+     * work was validated to SCRIPT level first.
+     */
+    auto GetValidationCompletionTime() const
+    {
+        return mValidationCompletionTime;
     }
 
     std::string ToString() const {
@@ -437,6 +612,11 @@ public:
             return false;
         }
 
+        if (ValidityChangeRequiresValidationTimeSetting(nUpTo))
+        {
+            mValidationCompletionTime = std::chrono::steady_clock::now();
+        }
+
         nStatus = nStatus.withValidity(nUpTo);
         return true;
     }
@@ -447,6 +627,26 @@ public:
     //! Efficiently find an ancestor of this block.
     CBlockIndex *GetAncestor(int height);
     const CBlockIndex *GetAncestor(int height) const;
+
+protected:
+    CDiskBlockMetaData mDiskBlockMetaData;
+
+    using SteadyClockTimePoint =
+        std::chrono::time_point<std::chrono::steady_clock>;
+    // Time when the block validation has been completed to SCRIPT level.
+    // This is a memmory only variable after reboot we can set it to
+    // SteadyClockTimePoint::min() (best possible candidate value) since after
+    // the validation we only care that best tip is valid and not which that
+    // best tip is (it's a race condition during validation anyway).
+    SteadyClockTimePoint mValidationCompletionTime;
+
+private:
+    bool ValidityChangeRequiresValidationTimeSetting(BlockValidity nUpTo) const
+    {
+        return
+            nUpTo == BlockValidity::SCRIPTS
+            && mValidationCompletionTime == SteadyClockTimePoint::max();
+    }
 };
 
 /**
@@ -458,8 +658,6 @@ struct BlockHasher {
 
 typedef std::unordered_map<uint256, CBlockIndex *, BlockHasher> BlockMap;
 extern BlockMap mapBlockIndex;
-
-arith_uint256 GetBlockProof(const CBlockIndex &block);
 
 /**
  * Return the time it would take to redo the work difference between from and
@@ -508,6 +706,11 @@ public:
         if (nStatus.hasUndo()) {
             READWRITE(VARINT(nUndoPos));
         }
+        if(nStatus.getValidity() == BlockValidity::SCRIPTS)
+        {
+            mValidationCompletionTime =
+                CBlockIndex::SteadyClockTimePoint::min();
+        }
 
         // block header
         READWRITE(this->nVersion);
@@ -516,6 +719,15 @@ public:
         READWRITE(nTime);
         READWRITE(nBits);
         READWRITE(nNonce);
+        if (nStatus.hasDiskBlockMetaData())
+        {
+            try {
+                READWRITE(mDiskBlockMetaData);
+            } catch (std::ios_base::failure &) {
+                nStatus = nStatus.withDiskBlockMetaData(false);
+                LogPrintf("Can not read metadata from block %s. Probably upgrading from downgraded version. \n", GetBlockHash().ToString());
+            }
+        }
     }
 
     uint256 GetBlockHash() const {
@@ -544,6 +756,7 @@ public:
 class CChain {
 private:
     std::vector<CBlockIndex *> vChain;
+    std::atomic<CBlockIndex*> mChainTip = nullptr;
 
 public:
     /**
@@ -557,9 +770,7 @@ public:
     /**
      * Returns the index entry for the tip of this chain, or nullptr if none.
      */
-    CBlockIndex *Tip() const {
-        return vChain.size() > 0 ? vChain[vChain.size() - 1] : nullptr;
-    }
+    CBlockIndex* Tip() const { return mChainTip; }
 
     /**
      * Returns the index entry at a particular height in this chain, or nullptr
@@ -596,10 +807,13 @@ public:
     }
 
     /**
-     * Return the maximal height in the chain. Is equal to chain.Tip() ?
-     * chain.Tip()->nHeight : -1.
+     * Return the maximal height in the chain or -1 if tip is not set.
      */
-    int Height() const { return vChain.size() - 1; }
+    int Height() const
+    {
+        const CBlockIndex* tip = mChainTip;
+        return tip ? tip->nHeight : -1;
+    }
 
     /** Set/initialize a chain with a given tip. */
     void SetTip(CBlockIndex *pindex);
@@ -619,6 +833,26 @@ public:
      * Find the earliest block with timestamp equal or greater than the given.
      */
     CBlockIndex *FindEarliestAtLeast(int64_t nTime) const;
+};
+
+/**
+ * class CChainActiveSharedData.
+ *
+ * TODO: This class becomes redundant once CChain offers mt support.
+ * For the time being, it is needed to share activeHeight & activeTipBlockHash
+ * between different threads without a need to hold cs_main.
+ */
+class CChainActiveSharedData {
+    std::atomic_int mChainActiveHeight {};
+    uint256 mChainActiveTipBlockHash { uint256() };
+    mutable std::shared_mutex mMainMtx {};
+
+public:
+    void SetChainActiveHeight(int height);
+    int GetChainActiveHeight() const;
+
+    void SetChainActiveTipBlockHash(uint256 blockHash);
+    uint256 GetChainActiveTipBlockHash() const;
 };
 
 #endif // BITCOIN_CHAIN_H

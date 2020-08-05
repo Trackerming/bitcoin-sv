@@ -169,16 +169,20 @@ Development tips and tricks
 
 **compiling for debugging**
 
-Run configure with the --enable-debug option, then make. Or run configure with
+- Autotools
+Run configure with the --enable-debug option (this will also enable -DDEBUG_LOCKORDER), then make. Or run configure with
 CXXFLAGS="-g -ggdb -O0" or whatever debug flags you need.
 
-**debug.log**
+- CMake
+To enable debug in CMake run `cmake -DCMAKE_BUILD_TYPE=Debug`. Add the `--enable-debug` option to enable -DDEBUG_LOCKORDER. Then run make.
 
-If the code is behaving strangely, take a look in the debug.log file in the data directory;
+**bitcoind.log**
+
+If the code is behaving strangely, take a look in the bitcoind.log file in the data directory;
 error and debugging messages are written there.
 
 The -debug=... command-line option controls debugging; running with just -debug or -debug=1 will turn
-on all categories (and give you a very large debug.log file).
+on all categories (and give you a very large bitcoind.log file).
 
 **running and debugging tests**
 
@@ -203,6 +207,55 @@ lldb -- test_bitcoin
 break set --file interpreter.cpp --line 295
 run
 ```
+
+**code instrumentation**
+
+CMake and autotools builds support code sanitizers for gcc and clang.
+In addition CMake buid also supports clang static code analysis.
+
+For CMake they can be enabled through CMake gui or CMake curses gui where they
+are listed and can be toggled on or off or by providing them on command line
+with `-D` CMake list options:
+```
+cmake -D enable_asan=ON <path_to_source_code>
+```
+
+For autotools they can be enabled at configuration step:
+```
+../configure --enable-asan
+```
+
+
+Supported sanitizers are:
+
+- `enable_asan` in CMake (`--enable-asan` for autotools) for detecting memory corruption, leaks, illegal memory access
+  - This sanitizer does not work in combination with assembly version of crypto implementation
+    so assembly must be disabled by setting `CRYPTO_USE_ASM` CMake list option to `OFF`
+    (`cmake -D BITCOIN_DEV_USE_ADDRESS_SANITIZER=ON -D CRYPTO_USE_ASM=OFF <path_to_source_code>`)
+  - This sanitizer does not work in combination with thread sanitizer being enabled
+  - gcc sanitizer can trigger `LeakSanitizer does not work under ptrace` error. In that case run the executable
+    with `ASAN_OPTIONS` environment variable (`ASAN_OPTIONS=detect_leaks=0 <executable_name>`) to disable the offending
+    checks
+- `enable_tsan` in CMake (`--enable-tsan` for autotools) for detecting race conditions (on gcc also potential dead locks)
+  - This sanitizer does not work in combination with address or ub sanitizer being enabled
+  - When sanitizer is enabled code execution is slowed down to approximately between 5 to 15 times
+  - on gcc this sanitizer also does some static potential dead lock checking which can generate false positives
+    as it by design doesn't consider execution order/order of data initialization
+- `enable_ubsan` in CMake (`--enable-ubsan` for autotools) for detecting use of behavior that is undefined by C++ standard
+  - This sanitizer does not work in combination with thread sanitizer being enabled
+  - gcc version of the sanitizer doesn't print stacktraces by default so they need to be enabled by running executable
+    with `UBSAN_OPTIONS` environment variable (`UBSAN_OPTIONS="print_stacktrace=1" <executable_name>`)
+- `enable_static_analyzer` for static analysis of code during compilation
+
+NOTE: Sanitizers change generated assembly code of an executable so running a program with them enabled
+does not guarantee that executable will work with them being disabled so during testing they should not
+be enable all the time. Since enabling sanitizers during the build changes the resulting executable,
+disabling them means recompiling the executable with sanitizers disabled in CMake/autotools build.
+
+NOTE: Sanitizers are a runtime feature so they report errors/warnings only when they occur during execution.
+This is especially true for thread sanitizer which can only detect race conditions if they actually occur
+during execution so if a single run passes without errors/warning there is no guarantee that the consecutive
+runs will as well so they are not a replacement for testing.
 
 **writing script integration tests**
 
@@ -229,7 +282,7 @@ that run in -regtest mode.
 Bitcoin Core is a multithreaded application, and deadlocks or other multithreading bugs
 can be very difficult to track down. Compiling with -DDEBUG_LOCKORDER (configure
 CXXFLAGS="-DDEBUG_LOCKORDER -g") inserts run-time checks to keep track of which locks
-are held, and adds warnings to the debug.log file if inconsistencies are detected.
+are held, and adds warnings to the bitcoind.log file if inconsistencies are detected.
 
 Locking/mutex usage notes
 -------------------------
@@ -241,7 +294,7 @@ Deadlocks due to inconsistent lock ordering (thread 1 locks cs_main
 and then cs_wallet, while thread 2 locks them in the opposite order:
 result, deadlock as each waits for the other to release its lock) are
 a problem. Compile with -DDEBUG_LOCKORDER to get lock order
-inconsistencies reported in the debug.log file.
+inconsistencies reported in the bitcoind.log file.
 
 Re-architecting the core code so there are better-defined interfaces
 between the various components is a goal, with any necessary locking

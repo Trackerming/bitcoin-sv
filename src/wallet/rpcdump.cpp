@@ -1,6 +1,6 @@
 // Copyright (c) 2009-2016 The Bitcoin Core developers
-// Distributed under the MIT software license, see the accompanying
-// file COPYING or http://www.opensource.org/licenses/mit-license.php.
+// Copyright (c) 2019 Bitcoin Association
+// Distributed under the Open BSV software license, see the accompanying file LICENSE.
 
 #include "base58.h"
 #include "chain.h"
@@ -193,7 +193,7 @@ void ImportScript(CWallet *const pwallet, const CScript &script,
         ImportAddress(pwallet, CScriptID(script), strLabel);
     } else {
         CTxDestination destination;
-        if (ExtractDestination(script, destination)) {
+        if (CWallet::ExtractDestination(script, destination)) {
             pwallet->SetAddressBook(destination, strLabel, "receive");
         }
     }
@@ -536,7 +536,6 @@ UniValue importwallet(const Config &config, const JSONRPCRequest &request) {
 
     bool fGood = true;
 
-    int64_t nFilesize = std::max((int64_t)1, (int64_t)file.tellg());
     file.seekg(0, file.beg);
 
     while (file.good()) {
@@ -1001,7 +1000,7 @@ UniValue ProcessImport(CWallet *const pwallet, const UniValue &data,
                 if (isScript) {
                     CTxDestination destination;
 
-                    if (ExtractDestination(script, destination)) {
+                    if (CWallet::ExtractDestination(script, destination)) {
                         if (!(destination == pubkey_dest)) {
                             throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY,
                                                "Consistency check failed");
@@ -1084,7 +1083,7 @@ UniValue ProcessImport(CWallet *const pwallet, const UniValue &data,
                 if (isScript) {
                     CTxDestination destination;
 
-                    if (ExtractDestination(script, destination)) {
+                    if (CWallet::ExtractDestination(script, destination)) {
                         if (!(destination == pubkey_dest)) {
                             throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY,
                                                "Consistency check failed");

@@ -1,6 +1,6 @@
 // Copyright (c) 2012-2016 The Bitcoin Core developers
-// Distributed under the MIT software license, see the accompanying
-// file COPYING or http://www.opensource.org/licenses/mit-license.php.
+// Copyright (c) 2019 Bitcoin Association
+// Distributed under the Open BSV software license, see the accompanying file LICENSE.
 
 #include "clientversion.h"
 
@@ -18,7 +18,12 @@ const std::string CLIENT_NAME("Bitcoin SV");
 /**
  * Client version number
  */
-#define CLIENT_VERSION_SUFFIX ""
+#ifdef IS_PRODUCTION_BUILD
+    #define CLIENT_VERSION_SUFFIX ""
+#else
+    #define CLIENT_VERSION_SUFFIX "-dev"
+#endif
+
 
 /**
  * The following part of the code determines the CLIENT_BUILD variable.

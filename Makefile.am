@@ -1,6 +1,6 @@
 # Copyright (c) 2013-2016 The Bitcoin Core developers
-# Distributed under the MIT software license, see the accompanying
-# file COPYING or http://www.opensource.org/licenses/mit-license.php.
+# Copyright (c) 2019 Bitcoin Association
+# Distributed under the Open BSV software license, see the accompanying file LICENSE.
 
 ACLOCAL_AMFLAGS = -I build-aux/m4
 SUBDIRS = src
@@ -37,9 +37,13 @@ DIST_CONTRIB = $(top_srcdir)/contrib/bitcoin-cli.bash-completion \
 BIN_CHECKS=$(top_srcdir)/contrib/devtools/symbol-check.py \
            $(top_srcdir)/contrib/devtools/security-check.py
 
+BUILD_FILES=$(top_srcdir)/share/genbuild.sh \
+            $(top_srcdir)/share/on_prod_tag.sh
+
 WINDOWS_PACKAGING = $(top_srcdir)/share/pixmaps/bitcoin.ico \
   $(top_srcdir)/share/pixmaps/nsis-header.bmp \
-  $(top_srcdir)/share/pixmaps/nsis-wizard.bmp
+  $(top_srcdir)/share/pixmaps/nsis-wizard.bmp \
+  $(top_srcdir)/doc/README_windows.txt
 
 COVERAGE_INFO = baseline_filtered_combined.info baseline.info \
   leveldb_baseline.info test_bitcoin_filtered.info total_coverage.info \
@@ -52,7 +56,6 @@ dist-hook:
 $(BITCOIN_WIN_INSTALLER): all-recursive
 	$(MKDIR_P) $(top_builddir)/release
 	STRIPPROG="$(STRIP)" $(INSTALL_STRIP_PROGRAM) $(BITCOIND_BIN) $(top_builddir)/release
-	STRIPPROG="$(STRIP)" $(INSTALL_STRIP_PROGRAM) $(top_builddir)/release
 	STRIPPROG="$(STRIP)" $(INSTALL_STRIP_PROGRAM) $(BITCOIN_CLI_BIN) $(top_builddir)/release
 	@test -f $(MAKENSIS) && $(MAKENSIS) -V2 $(top_builddir)/share/setup.nsi || \
 	  echo error: could not build $@
@@ -77,6 +80,7 @@ $(BITCOIN_SEEDER_BIN): FORCE
 if USE_LCOV
 
 baseline.info:
+	$(MAKE) -C src/
 	$(LCOV) -c -i -d $(abs_builddir)/src -o $@
 
 baseline_filtered.info: baseline.info
@@ -101,7 +105,7 @@ test_bitcoin_filtered.info: test_bitcoin.info
 	$(LCOV) -r $< "/usr/include/*" -o $@
 
 functional_test.info: test_bitcoin_filtered.info
-	-@TIMEOUT=15 python test/functional/test_runner.py $(EXTENDED_FUNCTIONAL_TESTS)
+	-@TIMEOUT=15 test/functional/test_runner.py $(EXTENDED_FUNCTIONAL_TESTS)
 	$(LCOV) -c -d $(abs_builddir)/src --t functional-tests -o $@
 	$(LCOV) -z -d $(abs_builddir)/src
 	$(LCOV) -z -d $(abs_builddir)/src/leveldb
@@ -129,7 +133,7 @@ endif
 
 dist_noinst_SCRIPTS = autogen.sh
 
-EXTRA_DIST = $(top_srcdir)/share/genbuild.sh test/functional/test_runner.py test/functional $(DIST_CONTRIB) $(DIST_DOCS) $(WINDOWS_PACKAGING) $(BIN_CHECKS)
+EXTRA_DIST = $(BUILD_FILES) test/functional/test_runner.py test/functional $(DIST_CONTRIB) $(DIST_DOCS) $(WINDOWS_PACKAGING) $(BIN_CHECKS)
 
 EXTRA_DIST += \
 	test/util/bitcoin-util-test.py \
@@ -159,14 +163,10 @@ EXTRA_DIST += \
 	test/util/data/txcreatedata_seq1.json \
 	test/util/data/txcreatemultisig1.hex \
 	test/util/data/txcreatemultisig1.json \
-	test/util/data/txcreatemultisig2.hex \
-	test/util/data/txcreatemultisig2.json \
 	test/util/data/txcreateoutpubkey1.hex \
 	test/util/data/txcreateoutpubkey1.json \
 	test/util/data/txcreatescript1.hex \
 	test/util/data/txcreatescript1.json \
-	test/util/data/txcreatescript2.hex \
-	test/util/data/txcreatescript2.json \
 	test/util/data/txcreatesignv1.hex \
 	test/util/data/txcreatesignv1.json \
 	test/util/data/txcreatesignv2.hex

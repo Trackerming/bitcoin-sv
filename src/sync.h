@@ -13,6 +13,8 @@
 #include <boost/thread/mutex.hpp>
 #include <boost/thread/recursive_mutex.hpp>
 
+#include <memory>
+
 /////////////////////////////////////////////////
 //                                             //
 // THE SIMPLE DEFINITION, EXCLUDING DEBUG CODE //
@@ -180,6 +182,36 @@ typedef CMutexLock<CCriticalSection> CCriticalBlock;
         LeaveCritical();                                                       \
     }
 
+/**
+ * RAII exiting and later re-entering a critical section.
+ *
+ * NOTE: This class unlocks a single layer. In case of reentrant mutexes we
+ *       can't know if there is more than one level that we need to unlock so
+ *       in that case our thread would remain locked even though this class was
+ *       used.
+ */
+class CTemporaryLeaveCriticalSectionGuard
+{
+public:
+    CTemporaryLeaveCriticalSectionGuard(CCriticalSection& cs)
+        : mCs{cs}
+    {
+        LEAVE_CRITICAL_SECTION(mCs)
+    }
+    ~CTemporaryLeaveCriticalSectionGuard()
+    {
+        ENTER_CRITICAL_SECTION(mCs)
+    }
+
+    CTemporaryLeaveCriticalSectionGuard(CTemporaryLeaveCriticalSectionGuard&&) = delete;
+    CTemporaryLeaveCriticalSectionGuard& operator=(CTemporaryLeaveCriticalSectionGuard&&) = delete;
+    CTemporaryLeaveCriticalSectionGuard(const CTemporaryLeaveCriticalSectionGuard&) = delete;
+    CTemporaryLeaveCriticalSectionGuard& operator=(const CTemporaryLeaveCriticalSectionGuard&) = delete;
+
+private:
+    CCriticalSection& mCs;
+};
+
 class CSemaphore {
 private:
     boost::condition_variable condition;
@@ -216,8 +248,8 @@ public:
 /** RAII-style semaphore lock */
 class CSemaphoreGrant {
 private:
-    CSemaphore *sem;
-    bool fHaveGrant;
+    std::shared_ptr<CSemaphore> sem {nullptr};
+    bool fHaveGrant {false};
 
 public:
     void Acquire() {
@@ -244,10 +276,10 @@ public:
         fHaveGrant = false;
     }
 
-    CSemaphoreGrant() : sem(nullptr), fHaveGrant(false) {}
+    CSemaphoreGrant() = default;
 
-    CSemaphoreGrant(CSemaphore &sema, bool fTry = false)
-        : sem(&sema), fHaveGrant(false) {
+    CSemaphoreGrant(const std::shared_ptr<CSemaphore>& sema, bool fTry = false)
+        : sem(sema), fHaveGrant(false) {
         if (fTry)
             TryAcquire();
         else

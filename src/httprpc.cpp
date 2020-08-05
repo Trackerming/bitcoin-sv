@@ -1,6 +1,6 @@
 // Copyright (c) 2015-2016 The Bitcoin Core developers
-// Distributed under the MIT software license, see the accompanying
-// file COPYING or http://www.opensource.org/licenses/mit-license.php.
+// Copyright (c) 2019 Bitcoin Association
+// Distributed under the Open BSV software license, see the accompanying file LICENSE.
 
 #include "httprpc.h"
 
@@ -16,6 +16,7 @@
 #include "ui_interface.h"
 #include "util.h"
 #include "utilstrencodings.h"
+#include "rpc/blockchain.h"
 
 #include <boost/algorithm/string.hpp> // boost::trim
 
@@ -322,20 +323,14 @@ static bool HTTPReq_JSONRPC(Config &config, HTTPRequest *req,
         // singleton request
         if (valRequest.isObject()) {
             jreq.parse(valRequest);
-
-            UniValue result = tableRPC.execute(config, jreq);
-
-            // Send reply
-            strReply = JSONRPCReply(result, NullUniValue, jreq.id);
+            tableRPC.execute(config, jreq, req, false);
+        // array of requests
         } else if (valRequest.isArray()) {
-            // array of requests
-            strReply = JSONRPCExecBatch(config, jreq, valRequest.get_array());
+            JSONRPCExecBatch(config, jreq, valRequest.get_array(), *req);
         } else {
             throw JSONRPCError(RPC_PARSE_ERROR, "Top-level object parse error");
         }
 
-        req->WriteHeader("Content-Type", "application/json");
-        req->WriteReply(HTTP_OK, strReply);
     } catch (const UniValue &objError) {
         JSONErrorReply(req, objError, jreq.id);
         return false;
@@ -352,7 +347,7 @@ static bool InitRPCAuthentication() {
         if (!GenerateAuthCookie(&strRPCUserColonPass)) {
             // Same message as AbortNode.
             uiInterface.ThreadSafeMessageBox(
-                _("Error: A fatal internal error occurred, see debug.log for "
+                _("Error: A fatal internal error occurred, see bitcoind.log for "
                   "details"),
                 "", CClientUIInterface::MSG_ERROR);
             return false;

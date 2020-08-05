@@ -1,7 +1,7 @@
 // Copyright (c) 2009-2010 Satoshi Nakamoto
 // Copyright (c) 2009-2016 The Bitcoin Core developers
-// Distributed under the MIT software license, see the accompanying
-// file COPYING or http://www.opensource.org/licenses/mit-license.php.
+// Copyright (c) 2019 Bitcoin Association
+// Distributed under the Open BSV software license, see the accompanying file LICENSE.
 
 #ifndef BITCOIN_CHAINPARAMS_H
 #define BITCOIN_CHAINPARAMS_H
@@ -38,6 +38,16 @@ struct ChainTxData {
     int64_t nTime;
     int64_t nTxCount;
     double dTxRate;
+};
+
+// Contains defaults for block size related parameters. 
+// Defaults are used changed based on activation time
+
+struct DefaultBlockSizeParams {
+    int64_t blockSizeActivationTime;
+    uint64_t maxBlockSize;
+    uint64_t maxGeneratedBlockSizeBefore;
+    uint64_t maxGeneratedBlockSizeAfter;
 };
 
 /**
@@ -83,14 +93,15 @@ public:
     const std::vector<uint8_t> &Base58Prefix(Base58Type type) const {
         return base58Prefixes[type];
     }
-    const std::string &CashAddrPrefix() const { return cashaddrPrefix; }
     const std::vector<SeedSpec6> &FixedSeeds() const { return vFixedSeeds; }
     const CCheckpointData &Checkpoints() const { return checkpointData; }
     const ChainTxData &TxData() const { return chainTxData; }
-    void UpdateBIP9Parameters(Consensus::DeploymentPos d, int64_t nStartTime,
-                              int64_t nTimeout);
+    const DefaultBlockSizeParams &GetDefaultBlockSizeParams() const { return defaultBlockSizeParams; }
+
+    bool TestBlockCandidateValidity() const { return fTestBlockCandidateValidity; }
 
 protected:
+    friend void ResetNetMagic(CChainParams& chainParam, const std::string& hexcode);
     CChainParams() {}
 
     Consensus::Params consensus;
@@ -100,7 +111,6 @@ protected:
     uint64_t nPruneAfterHeight;
     std::vector<CDNSSeedData> vSeeds;
     std::vector<uint8_t> base58Prefixes[MAX_BASE58_TYPES];
-    std::string cashaddrPrefix;
     std::string strNetworkID;
     CBlock genesis;
     std::vector<SeedSpec6> vFixedSeeds;
@@ -108,9 +118,16 @@ protected:
     bool fDefaultConsistencyChecks;
     bool fRequireStandard;
     bool fMineBlocksOnDemand;
+    bool fTestBlockCandidateValidity;
     CCheckpointData checkpointData;
     ChainTxData chainTxData;
+    DefaultBlockSizeParams defaultBlockSizeParams;
 };
+
+/**
+ * Convert hex string into CMessageHeader::MessageMagic
+ */
+bool HexToArray(const std::string& hexstring, CMessageHeader::MessageMagic& array);
 
 /**
  * Creates and returns a std::unique_ptr<CChainParams> of the chosen chain.
@@ -130,11 +147,5 @@ const CChainParams &Params();
  * @throws std::runtime_error when the chain is not supported.
  */
 void SelectParams(const std::string &chain);
-
-/**
- * Allows modifying the BIP9 regtest parameters.
- */
-void UpdateBIP9Parameters(Consensus::DeploymentPos d, int64_t nStartTime,
-                          int64_t nTimeout);
 
 #endif // BITCOIN_CHAINPARAMS_H

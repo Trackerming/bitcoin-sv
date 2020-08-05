@@ -14,13 +14,16 @@
 #include "ui_interface.h"
 #include "util.h"
 #include "utilstrencodings.h"
+#include "blockchain.h"
 
 #include <univalue.h>
 
-#include <boost/algorithm/string/case_conv.hpp> // for to_upper()
 #include <boost/bind.hpp>
 #include <boost/signals2/signal.hpp>
 #include <boost/thread.hpp>
+#include <boost/algorithm/string/case_conv.hpp> // for to_upper()
+#include <boost/algorithm/string/classification.hpp>
+#include <boost/algorithm/string/split.hpp>
 
 #include <memory> // for unique_ptr
 #include <set>
@@ -140,7 +143,7 @@ uint256 ParseHashV(const UniValue &v, std::string strName) {
     if (!IsHex(strHex))
         throw JSONRPCError(RPC_INVALID_PARAMETER,
                            strName + " must be hexadecimal string (not '" +
-                               strHex + "')");
+                               strHex + "') and length of it must be devisible by 2");
     if (64 != strHex.length())
         throw JSONRPCError(RPC_INVALID_PARAMETER,
                            strprintf("%s must be of length %d (not %d)",
@@ -158,7 +161,7 @@ std::vector<uint8_t> ParseHexV(const UniValue &v, std::string strName) {
     if (!IsHex(strHex))
         throw JSONRPCError(RPC_INVALID_PARAMETER,
                            strName + " must be hexadecimal string (not '" +
-                               strHex + "')");
+                               strHex + "') and length of it must be devisible by 2");
     return ParseHex(strHex);
 }
 std::vector<uint8_t> ParseHexO(const UniValue &o, std::string strKey) {
@@ -255,6 +258,9 @@ static UniValue stop(const Config &config, const JSONRPCRequest &jsonRequest) {
     if (jsonRequest.fHelp || jsonRequest.params.size() > 1)
         throw std::runtime_error("stop\n"
                                  "\nStop Bitcoin server.");
+
+    LogPrintf("Received RPC call stop()\n");
+
     // Event loop will exit after current HTTP requests have been handled, so
     // this reply will get back to the client.
     StartShutdown();
@@ -394,33 +400,38 @@ void JSONRPCRequest::parse(const UniValue &valRequest) {
                            "Params must be an array or object");
 }
 
-static UniValue JSONRPCExecOne(Config &config, JSONRPCRequest jreq,
-                               const UniValue &req) {
+static void JSONRPCExecOne(Config &config, JSONRPCRequest jreq,
+                           const UniValue &req, HTTPRequest& httpReq) {
     UniValue rpc_result(UniValue::VOBJ);
 
     try {
         jreq.parse(req);
-
-        UniValue result = tableRPC.execute(config, jreq);
-        rpc_result = JSONRPCReplyObj(result, NullUniValue, jreq.id);
+        // Support response to be written in multiple chunks
+        tableRPC.execute(config, jreq, &httpReq, true);
     } catch (const UniValue &objError) {
-        rpc_result = JSONRPCReplyObj(NullUniValue, objError, jreq.id);
+        httpReq.WriteReplyChunk(JSONRPCReplyObj(NullUniValue, objError, jreq.id).write());
     } catch (const std::exception &e) {
         rpc_result = JSONRPCReplyObj(
             NullUniValue, JSONRPCError(RPC_PARSE_ERROR, e.what()), jreq.id);
+        httpReq.WriteReplyChunk(rpc_result.write());
     }
-
-    return rpc_result;
 }
 
-std::string JSONRPCExecBatch(Config &config, const JSONRPCRequest &jreq,
-                             const UniValue &vReq) {
-    UniValue ret(UniValue::VARR);
-    for (size_t i = 0; i < vReq.size(); i++) {
-        ret.push_back(JSONRPCExecOne(config, jreq, vReq[i]));
-    }
+void JSONRPCExecBatch(Config &config, const JSONRPCRequest &jreq,
+                             const UniValue &vReq, HTTPRequest& httpReq) {
 
-    return ret.write() + "\n";
+    httpReq.WriteHeader("Content-Type", "application/json");
+    httpReq.StartWritingChunks(HTTP_OK);
+
+    httpReq.WriteReplyChunk("[");
+    std::string delimiter;
+    for (size_t i = 0; i < vReq.size(); i++) {
+        httpReq.WriteReplyChunk(delimiter);
+        JSONRPCExecOne(config, jreq, vReq[i], httpReq);
+        delimiter = ",";
+    }
+    httpReq.WriteReplyChunk("]\n");
+    httpReq.StopWritingChunks();
 }
 
 /**
@@ -442,8 +453,15 @@ transformNamedArguments(const JSONRPCRequest &in,
     }
     // Process expected parameters.
     int hole = 0;
-    for (const std::string &argName : argNames) {
-        auto fr = argsIn.find(argName);
+    for (const std::string &argNamePattern : argNames) {std::vector<std::string> vargNames;
+        boost::algorithm::split(vargNames, argNamePattern, boost::algorithm::is_any_of("|"));
+        auto fr = argsIn.end();
+        for (const std::string & argName : vargNames) {
+            fr = argsIn.find(argName);
+            if (fr != argsIn.end()) {
+                break;
+            }
+        }
         if (fr != argsIn.end()) {
             for (int i = 0; i < hole; ++i) {
                 // Fill hole between specified parameters with JSON nulls, but
@@ -467,8 +485,37 @@ transformNamedArguments(const JSONRPCRequest &in,
     return out;
 }
 
-UniValue CRPCTable::execute(Config &config,
-                            const JSONRPCRequest &request) const {
+UniValue CRPCCommand::call(Config &config, const JSONRPCRequest &jsonRequest, HTTPRequest *httpReq, bool processedInBatch) const
+{
+    UniValue result;
+    if (useHTTPRequest)
+    {
+        (*actor.http_fn)(config, jsonRequest, *httpReq, processedInBatch);
+        result = NullUniValue;
+    }
+    else
+    {
+        result = useConstConfig ? (*actor.cfn)(config, jsonRequest)
+                                : (*actor.fn)(config, jsonRequest);
+        if (httpReq && processedInBatch)
+        {
+            // Response for this RPC method is written as a single chunk
+            httpReq->WriteReplyChunk(JSONRPCReplyObj(result, NullUniValue, jsonRequest.id).write());
+        }
+        else if (httpReq)
+        {
+            std::string strReply = JSONRPCReply(result, NullUniValue, jsonRequest.id);
+            httpReq->WriteHeader("Content-Type", "application/json");
+            httpReq->WriteReply(HTTP_OK, strReply);
+        }
+    }
+    return result;
+}
+
+void CRPCTable::execute(Config &config,
+                            const JSONRPCRequest &request,
+                            HTTPRequest *httpReq,
+                            bool processedInBatch) const {
     // Return immediately if in warmup
     {
         LOCK(cs_rpcWarmup);
@@ -484,10 +531,12 @@ UniValue CRPCTable::execute(Config &config,
     try {
         // Execute, convert arguments to array if necessary
         if (request.params.isObject()) {
-            return pcmd->call(config,
-                              transformNamedArguments(request, pcmd->argNames));
+            pcmd->call(config,
+                       transformNamedArguments(request, pcmd->argNames),
+                       httpReq,
+                       processedInBatch);
         } else {
-            return pcmd->call(config, request);
+            pcmd->call(config, request, httpReq, processedInBatch);
         }
     } catch (const std::exception &e) {
         throw JSONRPCError(RPC_MISC_ERROR, e.what());

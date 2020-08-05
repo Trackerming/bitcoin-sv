@@ -1,11 +1,16 @@
 # Copyright (c) 2018 The Bitcoin developers
+# Copyright (c) 2019 Bitcoin Association
+# Distributed under the Open BSV software license, see the accompanying file LICENSE.
 
 project(bitcoin-test)
 
 # Process json files.
 file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/data")
 
-find_program(PYTHON python)
+# Python is required to build C++ tests (and to execute functional tests)
+find_package(PythonInterp 3 REQUIRED)
+
+
 function(gen_json_header NAME)
 	set(HEADERS "")
 	foreach(f ${ARGN})
@@ -14,7 +19,7 @@ function(gen_json_header NAME)
 		# Get the proper name for the test variable.
 		get_filename_component(TEST_NAME ${f} NAME_WE)
 		add_custom_command(OUTPUT ${h}
-			COMMAND ${PYTHON}
+			COMMAND ${PYTHON_EXECUTABLE}
 			ARGS
 				"${CMAKE_CURRENT_SOURCE_DIR}/data/generate_header.py"
 				"${TEST_NAME}"
@@ -44,6 +49,7 @@ create_test_suite(bitcoin)
 add_dependencies(check check-bitcoin)
 
 add_test_to_suite(bitcoin test_bitcoin
+	alertnotify_tests.cpp
 	arith_uint256_tests.cpp
 	addrman_tests.cpp
 	amount_tests.cpp
@@ -51,50 +57,64 @@ add_test_to_suite(bitcoin test_bitcoin
 	base32_tests.cpp
 	base58_tests.cpp
 	base64_tests.cpp
+    big_int_tests.cpp
 	bip32_tests.cpp
 	blockcheck_tests.cpp
 	blockencodings_tests.cpp
+	block_info_tests.cpp
+	blockmaxsize_tests.cpp
+	blockfile_reading_tests.cpp
 	blockstatus_tests.cpp
+	blockvalidationstatus_tests.cpp
 	bloom_tests.cpp
+    bn_op_tests.cpp
 	bswap_tests.cpp
-	cashaddr_tests.cpp
-	cashaddrenc_tests.cpp
 	checkpoints_tests.cpp
+	checkqueue_tests.cpp
 	coins_tests.cpp
 	compress_tests.cpp
 	config_tests.cpp
 	core_io_tests.cpp
 	crypto_tests.cpp
+	cscript_tests.cpp
 	cuckoocache_tests.cpp
 	dbwrapper_tests.cpp
 	DoS_tests.cpp
 	dstencode_tests.cpp
+	enum_cast_tests.cpp
 	excessiveblock_tests.cpp
 	getarg_tests.cpp
 	hash_tests.cpp
 	inv_tests.cpp
+    int_serialization_tests.cpp
+    instruction_iterator_tests.cpp
+	journal_tests.cpp
+	json_tests.cpp
 	jsonutil.cpp
 	key_tests.cpp
 	limitedmap_tests.cpp
+	limitedstack_tests.cpp
+	locked_ref_tests.cpp
+	m_candidates_tests.cpp
 	main_tests.cpp
 	mempool_tests.cpp
 	merkle_tests.cpp
 	miner_tests.cpp
+	object_stream_deserialization_tests.cpp
 	opcode_tests.cpp
 	multisig_tests.cpp
 	net_tests.cpp
 	netbase_tests.cpp
 	pmt_tests.cpp
-	policyestimator_tests.cpp
 	pow_tests.cpp
 	prevector_tests.cpp
+	protocol_tests.cpp
 	raii_event_tests.cpp
 	random_tests.cpp
 	reverselock_tests.cpp
 	rpc_tests.cpp
 	sanity_tests.cpp
 	scheduler_tests.cpp
-	script_commitment_tests.cpp
 	script_P2SH_tests.cpp
 	script_tests.cpp
 	scriptflags.cpp
@@ -106,13 +126,23 @@ add_test_to_suite(bitcoin test_bitcoin
 	sigutil.cpp
 	skiplist_tests.cpp
 	streams_tests.cpp
+	stream_serialization_tests.cpp
+	string_writer_tests.cpp
+	taskcancellation_tests.cpp
 	test_bitcoin.cpp
 	test_bitcoin_main.cpp
+	test_double_spend_detector.cpp
+	test_orphantxns.cpp
+	test_recent_rejects.cpp
+	test_txnvalidation_utils.cpp
+	test_txnvalidator.cpp
 	testutil.cpp
+    threadpool_tests.cpp
 	timedata_tests.cpp
+    time_locked_mempool_tests.cpp
+	ttor_tests.cpp
 	transaction_tests.cpp
 	txvalidationcache_tests.cpp
-	versionbits_tests.cpp
 	uint256_tests.cpp
 	undo_tests.cpp
 	univalue_tests.cpp
@@ -133,7 +163,12 @@ target_include_directories(test_bitcoin
 
 find_package(Boost 1.58 REQUIRED unit_test_framework)
 
-target_link_libraries(test_bitcoin Boost::unit_test_framework rpcclient server)
+target_link_libraries(
+	test_bitcoin
+	Boost::unit_test_framework
+	rpcclient
+	server
+	$<$<PLATFORM_ID:Linux>:rt>) # use librt.so for aio on Linux
 
 # We need to detect if the BOOST_TEST_DYN_LINK flag is required.
 set(CMAKE_REQUIRED_LIBRARIES Boost::unit_test_framework)

@@ -1,7 +1,7 @@
 // Copyright (c) 2009-2010 Satoshi Nakamoto
 // Copyright (c) 2009-2016 The Bitcoin Core developers
-// Distributed under the MIT software license, see the accompanying
-// file COPYING or http://www.opensource.org/licenses/mit-license.php.
+// Copyright (c) 2019 Bitcoin Association
+// Distributed under the Open BSV software license, see the accompanying file LICENSE.
 
 #ifndef BITCOIN_WALLET_WALLET_H
 #define BITCOIN_WALLET_WALLET_H
@@ -29,6 +29,7 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include <random>
 
 typedef CWallet *CWalletRef;
 extern std::vector<CWalletRef> vpwallets;
@@ -37,7 +38,6 @@ extern std::vector<CWalletRef> vpwallets;
  * Settings
  */
 extern CFeeRate payTxFee;
-extern unsigned int nTxConfirmTarget;
 extern bool bSpendZeroConfChange;
 
 static const unsigned int DEFAULT_KEYPOOL_SIZE = 1000;
@@ -57,8 +57,6 @@ static const Amount MIN_FINAL_CHANGE = MIN_CHANGE / 2;
 static const bool DEFAULT_SPEND_ZEROCONF_CHANGE = true;
 //! Default for -walletrejectlongchains
 static const bool DEFAULT_WALLET_REJECT_LONG_CHAINS = false;
-//! -txconfirmtarget default
-static const unsigned int DEFAULT_TX_CONFIRM_TARGET = 6;
 //! Largest (in bytes) free transaction we're willing to create
 static const unsigned int MAX_FREE_TRANSACTION_CREATE_SIZE = 1000;
 static const bool DEFAULT_WALLETBROADCAST = true;
@@ -242,21 +240,27 @@ public:
      *  0  : in memory pool, waiting to be included in a block
      * >=1 : this many blocks deep in the main chain
      */
-    int GetDepthInMainChain(const CBlockIndex *&pindexRet) const;
-    int GetDepthInMainChain() const {
-        const CBlockIndex *pindexRet;
-        return GetDepthInMainChain(pindexRet);
-    }
+    int GetDepthInMainChain() const;
     bool IsInMainChain() const {
-        const CBlockIndex *pindexRet;
-        return GetDepthInMainChain(pindexRet) > 0;
+        return GetDepthInMainChain() > 0;
     }
     int GetBlocksToMaturity() const;
+    /**
+     * Return height of transaction in blockchain. If in mempool returs MEMPOOL_HEIGHT
+     */
+    int GetHeightInMainChain() const;
+    /**
+    * Return is the transaction height larger or equal to the genesis activation height. 
+    * If in mempool, we assume that it will be mined in next block.
+    */
+    bool IsGenesisEnabled() const;
+
+
     /**
      * Pass this transaction to the mempool. Fails if absolute fee exceeds
      * absurd fee.
      */
-    bool AcceptToMemoryPool(const Amount nAbsurdFee, CValidationState &state);
+    bool SubmitTxToMempool(const Amount nAbsurdFee, CValidationState &state);
     bool hashUnset() const {
         return (hashBlock.IsNull() || hashBlock == ABANDON_HASH);
     }
@@ -594,6 +598,7 @@ class CWallet final : public CCryptoKeyStore, public CValidationInterface {
 private:
     static std::atomic<bool> fFlushScheduled;
 
+    mutable std::mt19937 randomNumbers;
     /**
      * Select a set of coins such that nValueRet >= nTargetValue and at least
      * all coins from coinControl are selected; Never select unconfirmed coins
@@ -710,14 +715,14 @@ public:
 
     // Create wallet with dummy database handle
     CWallet(const CChainParams &chainParams)
-        : dbw(new CWalletDBWrapper()), chainParams(chainParams) {
+        : randomNumbers(std::random_device{}()), dbw(new CWalletDBWrapper()), chainParams(chainParams) {
         SetNull();
     }
 
     // Create wallet with passed-in database handle
     CWallet(const CChainParams &chainParams,
             std::unique_ptr<CWalletDBWrapper> dbw_in)
-        : dbw(std::move(dbw_in)), chainParams(chainParams) {
+        : randomNumbers(std::random_device{}()), dbw(std::move(dbw_in)), chainParams(chainParams) {
         SetNull();
     }
 
@@ -925,7 +930,7 @@ public:
                            CWalletTx &wtxNew, CReserveKey &reservekey,
                            Amount &nFeeRet, int &nChangePosInOut,
                            std::string &strFailReason,
-                           const CCoinControl *coinControl = nullptr,
+                           const CCoinControl& coinControl,
                            bool sign = true);
     bool CommitTransaction(CWalletTx &wtxNew, CReserveKey &reservekey,
                            CConnman *connman, CValidationState &state);
@@ -935,29 +940,17 @@ public:
     bool AddAccountingEntry(const CAccountingEntry &);
     bool AddAccountingEntry(const CAccountingEntry &, CWalletDB *pwalletdb);
     template <typename ContainerType>
-    bool DummySignTx(CMutableTransaction &txNew, const ContainerType &coins);
+    bool DummySignTx(const Config& config, CMutableTransaction& txNew, const ContainerType& coins);
 
     static CFeeRate minTxFee;
     static CFeeRate fallbackFee;
-    /**
-     * Estimate the minimum fee considering user set parameters and the required
-     * fee
-     */
-    static Amount GetMinimumFee(unsigned int nTxBytes,
-                                unsigned int nConfirmTarget,
-                                const CTxMemPool &pool);
-    /**
-     * Estimate the minimum fee considering required fee and targetFee or if 0
-     * then fee estimation for nConfirmTarget
-     */
-    static Amount GetMinimumFee(unsigned int nTxBytes,
-                                unsigned int nConfirmTarget,
-                                const CTxMemPool &pool, Amount targetFee);
-    /**
-     * Return the minimum required fee taking into account the floating relay
-     * fee and user set minimum transaction fee
-     */
-    static Amount GetRequiredFee(unsigned int nTxBytes);
+    Amount GetMinimumFee(unsigned int nTxBytes,
+                         const CCoinControl &coin_control,
+                         const CTxMemPool &pool);
+
+    CFeeRate GetRequiredFeeRate();
+
+    CFeeRate GetMinimumFeeRate(const CCoinControl & coin_control, const CTxMemPool & pool);
 
     bool NewKeyPool();
     size_t KeypoolCountExternalKeys();
@@ -1024,7 +1017,7 @@ public:
         }
     }
 
-    void GetScriptForMining(std::shared_ptr<CReserveScript> &script);
+    void GetScriptForMining(std::shared_ptr<CReserveScript> &script) override;
 
     unsigned int GetKeyPoolSize() {
         // set{Ex,In}ternalKeyPool
@@ -1139,6 +1132,11 @@ public:
      */
     bool SetHDMasterKey(const CPubKey &key,
                         CHDChain *possibleOldChain = nullptr);
+
+    /**
+     * Extract single destination from script even if it is p2sh (multisig not supported)
+     */
+    static bool ExtractDestination(const CScript &scriptPubKey, CTxDestination &addressRet);
 };
 
 /** A key allocated from the key pool. */
@@ -1193,8 +1191,8 @@ public:
 // ContainerType is meant to hold pair<CWalletTx *, int>, and be iterable so
 // that each entry corresponds to each vIn, in order.
 template <typename ContainerType>
-bool CWallet::DummySignTx(CMutableTransaction &txNew,
-                          const ContainerType &coins) {
+bool CWallet::DummySignTx(const Config& config, CMutableTransaction& txNew,
+                          const ContainerType& coins) {
     // Fill in dummy signatures for fee calculation.
     int nIn = 0;
     for (const auto &coin : coins) {
@@ -1202,7 +1200,7 @@ bool CWallet::DummySignTx(CMutableTransaction &txNew,
             coin.first->tx->vout[coin.second].scriptPubKey;
         SignatureData sigdata;
 
-        if (!ProduceSignature(DummySignatureCreator(this), scriptPubKey,
+        if (!ProduceSignature(config, false, DummySignatureCreator(this), true, false, scriptPubKey,
                               sigdata)) {
             return false;
         } else {

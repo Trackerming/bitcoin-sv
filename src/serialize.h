@@ -1,13 +1,16 @@
 // Copyright (c) 2009-2010 Satoshi Nakamoto
 // Copyright (c) 2009-2016 The Bitcoin Core developers
-// Distributed under the MIT software license, see the accompanying
-// file COPYING or http://www.opensource.org/licenses/mit-license.php.
+// Copyright (c) 2019 Bitcoin Association
+// Distributed under the Open BSV software license, see the accompanying file LICENSE.
 
 #ifndef BITCOIN_SERIALIZE_H
 #define BITCOIN_SERIALIZE_H
 
 #include "compat/endian.h"
 
+#include <iostream>
+#include <string>
+#include <sstream>
 #include <algorithm>
 #include <cassert>
 #include <cstdint>
@@ -23,7 +26,7 @@
 
 #include "prevector.h"
 
-static const uint64_t MAX_SIZE = 0x02000000;
+static const uint64_t MAX_SIZE = std::numeric_limits<uint32_t>::max();
 
 /**
  * Dummy data type to identify deserializing constructors.
@@ -144,6 +147,7 @@ enum {
 };
 
 #define READWRITE(obj) (::SerReadWrite(s, (obj), ser_action))
+#define READWRITECOMPACTSIZE(obj) (::SerReadWriteCompactSize(s, (obj), ser_action))
 #define READWRITEMANY(...) (::SerReadWriteMany(s, ser_action, __VA_ARGS__))
 
 /**
@@ -261,6 +265,9 @@ inline uint32_t GetSizeOfCompactSize(uint64_t nSize) {
 inline void WriteCompactSize(CSizeComputer &os, uint64_t nSize);
 
 template <typename Stream> void WriteCompactSize(Stream &os, uint64_t nSize) {
+    if (nSize > MAX_SIZE) {
+          throw std::ios_base::failure("WriteCompactSize(): size too large");
+    }
     if (nSize < 253) {
         ser_writedata8(os, nSize);
     } else if (nSize <= std::numeric_limits<uint16_t>::max()) {
@@ -339,7 +346,8 @@ template <typename I> inline unsigned int GetSizeOfVarInt(I n) {
 
 template <typename I> inline void WriteVarInt(CSizeComputer &os, I n);
 
-template <typename Stream, typename I> void WriteVarInt(Stream &os, I n) {
+template <typename Stream, typename I, class = typename std::enable_if<std::is_integral<I>::value>::type>
+void WriteVarInt(Stream &os, I n) {
     uint8_t tmp[(sizeof(n) * 8 + 6) / 7];
     int len = 0;
     while (true) {
@@ -355,16 +363,33 @@ template <typename Stream, typename I> void WriteVarInt(Stream &os, I n) {
     } while (len--);
 }
 
-template <typename Stream, typename I> I ReadVarInt(Stream &is) {
-    I n = 0;
-    while (true) {
+template <typename Stream, typename I,class = typename std::enable_if<std::is_integral<I>::value>::type>
+I ReadVarInt(Stream &is) {
+    uintmax_t n {0};
+    // VarInt encoding is only defined for unsigned integers. However there are places in source code
+    // where ReadVarInt is called with a signed integer type (such as when serializing CDiskBlockPos)
+    // Those places need to make sure that the actual values are always non-negative. 
+    // Static cast in the following line if required to make MSVC compiler happy.
+    // It is safe, because the value that is being casted is always positive and will always
+    // fit in the unsigned version of type. 
+    static uintmax_t overflow { static_cast<uintmax_t>(std::numeric_limits<I>::max() >> 7) };
+
+    unsigned int maxSize = (sizeof(n) * 8 + 6) / 7;
+    for (unsigned int i = 0; i<maxSize; ++i){
+        if (n > overflow){
+            throw std::runtime_error ("Deserialisation Error ReadVarInt");
+        }
+
         uint8_t chData = ser_readdata8(is);
         n = (n << 7) | (chData & 0x7F);
         if ((chData & 0x80) == 0) {
-            return n;
+            return n ;
         }
         n++;
     }
+    // If we make it to hear its a deserialisation error
+    // throw an exception
+    throw std::runtime_error ("Deserialisation Error ReadVarInt");
 }
 
 #define FLATDATA(obj)                                                          \
@@ -499,6 +524,8 @@ void Unserialize_impl(Stream &is, prevector<N, T> &v, const V &);
 template <typename Stream, unsigned int N, typename T>
 inline void Unserialize(Stream &is, prevector<N, T> &v);
 
+
+
 /**
  * vector
  * vectors of uint8_t are a special case and are intended to be serialized as a
@@ -615,14 +642,19 @@ inline void Serialize(Stream &os, const prevector<N, T> &v) {
     Serialize_impl(os, v, T());
 }
 
+constexpr size_t STARTING_CHUNK_SIZE = 16000000; // 16MB
+constexpr size_t CHUNK_GROWTH_RATE = 3;
+
 template <typename Stream, unsigned int N, typename T>
 void Unserialize_impl(Stream &is, prevector<N, T> &v, const uint8_t &) {
     // Limit size per read so bogus size value won't cause out of memory
     v.clear();
     size_t nSize = ReadCompactSize(is);
     size_t i = 0;
+    size_t chunkSize = STARTING_CHUNK_SIZE;
     while (i < nSize) {
-        size_t blk = std::min(nSize - i, size_t(1 + 4999999 / sizeof(T)));
+        size_t blk = std::min(nSize - i, size_t(1 + (chunkSize - 1) / sizeof(T)));
+        chunkSize *= CHUNK_GROWTH_RATE;
         v.resize(i + blk);
         is.read((char *)&v[i], blk * sizeof(T));
         i += blk;
@@ -635,8 +667,10 @@ void Unserialize_impl(Stream &is, prevector<N, T> &v, const V &) {
     size_t nSize = ReadCompactSize(is);
     size_t i = 0;
     size_t nMid = 0;
+    size_t chunkSize = STARTING_CHUNK_SIZE;
     while (nMid < nSize) {
-        nMid += 5000000 / sizeof(T);
+        nMid += std::min(nSize, size_t(1 + (chunkSize - 1) / sizeof(T)));
+        chunkSize *= CHUNK_GROWTH_RATE;
         if (nMid > nSize) {
             nMid = nSize;
         }
@@ -646,6 +680,7 @@ void Unserialize_impl(Stream &is, prevector<N, T> &v, const V &) {
         }
     }
 }
+
 
 template <typename Stream, unsigned int N, typename T>
 inline void Unserialize(Stream &is, prevector<N, T> &v) {
@@ -682,13 +717,16 @@ void Unserialize_impl(Stream &is, std::vector<T, A> &v, const uint8_t &) {
     v.clear();
     size_t nSize = ReadCompactSize(is);
     size_t i = 0;
+    size_t chunkSize = STARTING_CHUNK_SIZE;
     while (i < nSize) {
-        size_t blk = std::min(nSize - i, size_t(1 + 4999999 / sizeof(T)));
+        size_t blk = std::min(nSize - i, size_t(1 + (chunkSize - 1) / sizeof(T)));
+        chunkSize *= CHUNK_GROWTH_RATE;
         v.resize(i + blk);
         is.read((char *)&v[i], blk * sizeof(T));
         i += blk;
     }
 }
+
 
 template <typename Stream, typename T, typename A, typename V>
 void Unserialize_impl(Stream &is, std::vector<T, A> &v, const V &) {
@@ -696,8 +734,10 @@ void Unserialize_impl(Stream &is, std::vector<T, A> &v, const V &) {
     size_t nSize = ReadCompactSize(is);
     size_t i = 0;
     size_t nMid = 0;
+    size_t chunkSize = STARTING_CHUNK_SIZE;
     while (nMid < nSize) {
-        nMid += 5000000 / sizeof(T);
+        nMid += std::min(nSize, size_t(1 + (chunkSize - 1) / sizeof(T)));
+        chunkSize *= CHUNK_GROWTH_RATE;
         if (nMid > nSize) {
             nMid = nSize;
         }
@@ -707,6 +747,7 @@ void Unserialize_impl(Stream &is, std::vector<T, A> &v, const V &) {
         }
     }
 }
+
 
 template <typename Stream, typename T, typename A>
 inline void Unserialize(Stream &is, std::vector<T, A> &v) {
@@ -819,6 +860,21 @@ inline void SerReadWrite(Stream &s, const T &obj,
 template <typename Stream, typename T>
 inline void SerReadWrite(Stream &s, T &obj, CSerActionUnserialize ser_action) {
     ::Unserialize(s, obj);
+}
+
+/**
+ * Support for READWRITECOMPACTSIZE macro
+ */
+
+template <typename Stream>
+inline void SerReadWriteCompactSize(Stream &s, const uint64_t &obj,
+                         CSerActionSerialize ser_action) {
+    ::WriteCompactSize(s, obj);
+}
+
+template <typename Stream>
+inline void SerReadWriteCompactSize(Stream &s, uint64_t &obj, CSerActionUnserialize ser_action) {
+    obj = ::ReadCompactSize(s);
 }
 
 /**

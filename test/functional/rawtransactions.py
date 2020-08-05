@@ -13,7 +13,10 @@
 """
 
 from test_framework.test_framework import BitcoinTestFramework
+from test_framework.mininode import CTransaction
 from test_framework.util import *
+
+from io import BytesIO
 
 # Create one-input, one-output, no-fee transaction:
 
@@ -21,7 +24,8 @@ from test_framework.util import *
 class RawTransactionsTest(BitcoinTestFramework):
     def set_test_params(self):
         self.setup_clean_chain = True
-        self.num_nodes = 3
+        self.num_nodes = 4
+        self.extra_args = [[],[],[],['-maxmempool=300']]
 
     def setup_network(self, split=False):
         super().setup_network()
@@ -206,6 +210,120 @@ class RawTransactionsTest(BitcoinTestFramework):
         rawtx = self.nodes[0].createrawtransaction(inputs, outputs)
         decrawtx = self.nodes[0].decoderawtransaction(rawtx)
         assert_equal(decrawtx['vin'][0]['sequence'], 4294967294)
+
+        # 11. check if getrawtransaction with verbose 'True' returns blockheight
+        assert isinstance(self.nodes[0].getrawtransaction(txHash, True)['blockheight'], int)
+        txList = self.nodes[0].getblockbyheight(self.nodes[0].getrawtransaction(txHash, True)['blockheight'])['tx']
+        assert txHash in txList
+
+        # tests with transactions containing data
+        # 1. sending ffffffff, we get 006a04ffffffff
+        # 00(OP_FALSE) 6a(OP_RETURN) 04(size of data, 4 bytes in this case) ffffffff(data)
+        addr = self.nodes[0].getnewaddress()
+        txid = self.nodes[0].sendtoaddress(addr, 2.0)
+        inputs = [{
+            "txid": txid,
+            "vout": 0,
+        }]
+        outputs = {
+                self.nodes[0].getnewaddress(): 0.5,
+                "data": 'ffffffff'
+            }
+        rawtx = self.nodes[0].createrawtransaction(inputs, outputs)
+        tx = CTransaction()
+        f = BytesIO(hex_str_to_bytes(rawtx))
+        tx.deserialize(f)
+        assert_equal(tx.vout[1].scriptPubKey.hex(), "006a04ffffffff")
+
+        # 2. sending ffffffff00000000, we get 006a08ffffffff00000000
+        # 00(OP_FALSE) 6a(OP_RETURN) 08(size of data, 8 bytes in this case) ffffffff00000000(data)
+        addr = self.nodes[0].getnewaddress()
+        txid = self.nodes[0].sendtoaddress(addr, 2.0)
+        inputs = [{
+            "txid": txid,
+            "vout": 0,
+        }]
+        outputs = {
+            self.nodes[0].getnewaddress(): 0.5,
+            "data": 'ffffffff00000000'
+        }
+        rawtx = self.nodes[0].createrawtransaction(inputs, outputs)
+        tx = CTransaction()
+        f = BytesIO(hex_str_to_bytes(rawtx))
+        tx.deserialize(f)
+        assert_equal(tx.vout[1].scriptPubKey.hex(), "006a08ffffffff00000000")
+
+        #
+        # Submit transaction without checking fee 1/2 #
+        #
+        self.nodes[3].generate(101)
+        self.sync_all()
+        txId = self.nodes[3].sendtoaddress(self.nodes[3].getnewaddress(), 30)
+        rawtx = self.nodes[3].getrawtransaction(txId,1)
+        # Identify the 30btc output
+        nOut = next(i for i, vout in enumerate(rawtx["vout"]) if vout["value"] == Decimal("30"))
+        inputs2 = []
+        outputs2 = {}
+        inputs2.append({"txid": txId, "vout": nOut})
+        outputs2 = {self.nodes[3].getnewaddress(): 30}
+        raw_tx2 = self.nodes[3].createrawtransaction(inputs2, outputs2)
+        tx_hex2 = self.nodes[3].signrawtransaction(raw_tx2)["hex"]
+        assert_raises_rpc_error(
+            -26, "insufficient priority", self.nodes[3].sendrawtransaction, tx_hex2, False, False
+        )
+        txid2 = self.nodes[3].sendrawtransaction(tx_hex2, False, True)
+        mempool = self.nodes[3].getrawmempool(False)
+        assert(txid2 in mempool)
+
+        self.nodes[3].generate(1)
+        self.sync_all()
+        assert_equal(self.nodes[3].gettransaction(txid2)["txid"], txid2)
+
+        
+        #
+        # Submit transaction without checking fee 2/2 #
+        #
+        relayfee = self.nodes[3].getnetworkinfo()['relayfee']
+        base_fee = relayfee * 1000
+        utxos = create_confirmed_utxos(relayfee, self.nodes[3], 335)
+        # fill up mempool
+        for j in range(332):
+            txn = utxos.pop()
+            send_value = txn['amount'] - base_fee
+            inputs = []
+            inputs.append({"txid": txn["txid"], "vout": txn["vout"]})
+            outputs = {}
+            addr = self.nodes[3].getnewaddress()
+            outputs[addr] = satoshi_round(send_value)
+            outputs["data"] = bytes_to_hex_str(bytearray(900000))
+
+            rawTxn = self.nodes[3].createrawtransaction(inputs, outputs)
+            signedTxn = self.nodes[3].signrawtransaction(rawTxn)["hex"]
+            self.nodes[3].sendrawtransaction(signedTxn, False, False)
+        
+        # create new transaction
+        mempoolsize = self.nodes[3].getmempoolinfo()['size']
+        txn = utxos.pop()
+        # now without fee
+        send_value = txn['amount']
+        inputs = []
+        inputs.append({"txid": txn["txid"], "vout": txn["vout"]})
+        outputs = {}
+        addr = self.nodes[3].getnewaddress()
+        outputs[addr] = satoshi_round(send_value)
+        outputs["data"] = bytes_to_hex_str(bytearray(999000))
+
+        rawTxn = self.nodes[3].createrawtransaction(inputs, outputs)
+        signedTxn = self.nodes[3].signrawtransaction(rawTxn)["hex"]
+        # without sufficient fee shouldn't get to mempool
+        assert_raises_rpc_error(
+            -26, "insufficient priority", self.nodes[3].sendrawtransaction, signedTxn, False, False
+        )
+        txid_new = self.nodes[3].sendrawtransaction(signedTxn, False, True)
+        mempoolsize_new = self.nodes[3].getmempoolinfo()['size']
+        # with 'dontcheckfee' other txn should be evicted
+        assert(txid_new in self.nodes[3].getrawmempool())
+        assert_equal(mempoolsize_new, mempoolsize)
 
 
 if __name__ == '__main__':

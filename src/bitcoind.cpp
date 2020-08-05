@@ -1,7 +1,7 @@
 // Copyright (c) 2009-2010 Satoshi Nakamoto
 // Copyright (c) 2009-2016 The Bitcoin Core developers
-// Distributed under the MIT software license, see the accompanying
-// file COPYING or http://www.opensource.org/licenses/mit-license.php.
+// Copyright (c) 2019 Bitcoin Association
+// Distributed under the Open BSV software license, see the accompanying LICENSE.
 
 #if defined(HAVE_CONFIG_H)
 #include "config/bitcoin-config.h"
@@ -26,6 +26,7 @@
 
 #include <cstdio>
 
+
 /* Introduction text for doxygen: */
 
 /*! \mainpage Developer documentation
@@ -34,25 +35,24 @@
  *
  * This is the developer documentation of Bitcoin SV
  * (https://bitcoinsv.io/). Bitcoin SV is a client for the digital
- * currency called Bitcoin Cash (https://www.bitcoincash.org/), which enables
- * instant payments to anyone, anywhere in the world. Bitcoin Cash uses
+ * currency called Bitcoin SV, which enables
+ * instant payments to anyone, anywhere in the world. Bitcoin SV uses
  * peer-to-peer technology to operate with no central authority: managing
  * transactions and issuing money are carried out collectively by the network.
  *
  * The software is a community-driven open source project, released under the
- * MIT license.
+ * Open BSV license.
  *
  * \section Navigation
  * Use the buttons <code>Namespaces</code>, <code>Classes</code> or
  * <code>Files</code> at the top of the page to start navigating the code.
  */
 
-void WaitForShutdown(boost::thread_group *threadGroup) {
-    bool fShutdown = ShutdownRequested();
+void WaitForShutdown(boost::thread_group *threadGroup, const task::CCancellationToken& shutdownToken) {
+
     // Tell the main threads to shutdown.
-    while (!fShutdown) {
+    while (!shutdownToken.IsCanceled()) {
         MilliSleep(200);
-        fShutdown = ShutdownRequested();
     }
     if (threadGroup) {
         Interrupt(*threadGroup);
@@ -65,6 +65,7 @@ void WaitForShutdown(boost::thread_group *threadGroup) {
 // Start
 //
 bool AppInit(int argc, char *argv[]) {
+    RenameThread("bitcoin-main");
     boost::thread_group threadGroup;
     CScheduler scheduler;
 
@@ -124,6 +125,22 @@ bool AppInit(int argc, char *argv[]) {
             return false;
         }
 
+        // Fill config with block size data
+        config.SetDefaultBlockSizeParams(Params().GetDefaultBlockSizeParams());
+
+        // maxstackmemoryusageconsensus and excessiveblocksize are required parameters
+        if (!gArgs.IsArgSet("-maxstackmemoryusageconsensus") || !gArgs.IsArgSet("-excessiveblocksize"))
+        {
+            fprintf(stderr, "Mandatory consensus parameter is not set. In order to start bitcoind you must set the "
+                            "following consensus parameters: \"excessiveblocksize\" and "
+                            "\"maxstackmemoryusageconsensus\". In order to start bitcoind with no limits you can set "
+                            "both of these parameters to 0 however it is strongly recommended to ensure you understand "
+                            "the implications of this setting.\n\n"
+                            "For more information of how to choose these settings safely for your use case refer to: "
+                            "https://bitcoinsv.io/choosing-consensus-settings/");
+            return false;
+        }
+
         // Command-line RPC
         bool fCommandLine = false;
         for (int i = 1; i < argc; i++)
@@ -176,7 +193,7 @@ bool AppInit(int argc, char *argv[]) {
 #endif // HAVE_DECL_DAEMON
         }
 
-        fRet = AppInitMain(config, threadGroup, scheduler);
+        fRet = AppInitMain(config, threadGroup, scheduler, GetShutdownToken());
     } catch (const std::exception &e) {
         PrintExceptionContinue(&e, "AppInit()");
     } catch (...) {
@@ -190,8 +207,11 @@ bool AppInit(int argc, char *argv[]) {
         // don't result in a hang due to some
         // thread-blocking-waiting-for-another-thread-during-startup case.
     } else {
-        WaitForShutdown(&threadGroup);
+        LogPrintf("Preload wait for shutdown\n");
+        WaitForShutdown(&threadGroup, GetShutdownToken());
+        LogPrintf("Preload wait for shutdown done\n");
     }
+    LogPrintf("Checking Thread shutdown\n");
     Shutdown();
 
     return fRet;

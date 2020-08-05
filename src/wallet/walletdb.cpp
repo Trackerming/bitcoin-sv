@@ -17,11 +17,13 @@
 #include "utiltime.h"
 #include "validation.h" // For CheckRegularTransaction
 #include "wallet/wallet.h"
+#include "config.h"
 
 #include <boost/thread.hpp>
 #include <boost/version.hpp>
 
 #include <atomic>
+#include <config.h>
 
 //
 // CWalletDB
@@ -33,7 +35,7 @@ bool CWalletDB::WriteName(const CTxDestination &address,
         return false;
     }
     return WriteIC(std::make_pair(std::string("name"),
-                                  EncodeLegacyAddr(address, Params())),
+                                  EncodeBase58Addr(address, Params())),
                    strName);
 }
 
@@ -45,7 +47,7 @@ bool CWalletDB::EraseName(const CTxDestination &address) {
         return false;
     }
     return EraseIC(std::make_pair(std::string("name"),
-                                  EncodeLegacyAddr(address, Params())));
+                                  EncodeBase58Addr(address, Params())));
 }
 
 bool CWalletDB::WritePurpose(const CTxDestination &address,
@@ -54,7 +56,7 @@ bool CWalletDB::WritePurpose(const CTxDestination &address,
         return false;
     }
     return WriteIC(std::make_pair(std::string("purpose"),
-                                  EncodeLegacyAddr(address, Params())),
+                                  EncodeBase58Addr(address, Params())),
                    strPurpose);
 }
 
@@ -63,7 +65,7 @@ bool CWalletDB::ErasePurpose(const CTxDestination &address) {
         return false;
     }
     return EraseIC(std::make_pair(std::string("purpose"),
-                                  EncodeLegacyAddr(address, Params())));
+                                  EncodeBase58Addr(address, Params())));
 }
 
 bool CWalletDB::WriteTx(const CWalletTx &wtx) {
@@ -301,9 +303,15 @@ bool ReadKeyValue(CWallet *pwallet, CDataStream &ssKey, CDataStream &ssValue,
             CWalletTx wtx;
             ssValue >> wtx;
             CValidationState state;
+            const Config& config = GlobalConfig::GetConfig();
+            // Assume post-Genesis sig-op count as limit. It's unlikely that user stores invalid txs (those with 
+            // too high sigop count) in his wallet and would try to use them before Genesis
+            bool genesisEnabled =  wtx.IsGenesisEnabled();
+            uint64_t maxTxSigOpsCountConsensusBeforeGenesis = config.GetMaxTxSigOpsCountConsensusBeforeGenesis();
+            uint64_t maxTxSizeConsensus = config.GetMaxTxSize(genesisEnabled, true);
             bool isValid = wtx.IsCoinBase()
-                               ? CheckCoinbase(wtx, state)
-                               : CheckRegularTransaction(wtx, state);
+                               ? CheckCoinbase(wtx, state, maxTxSigOpsCountConsensusBeforeGenesis, maxTxSizeConsensus, genesisEnabled)
+                               : CheckRegularTransaction(wtx, state, maxTxSigOpsCountConsensusBeforeGenesis, maxTxSizeConsensus, genesisEnabled);
             if (wtx.GetId() != hash || !isValid) {
                 return false;
             }
@@ -532,7 +540,7 @@ DBErrors CWalletDB::LoadWallet(CWallet *pwallet) {
     bool fNoncriticalErrors = false;
     DBErrors result = DB_LOAD_OK;
 
-    LOCK(pwallet->cs_wallet);
+    LOCK2(cs_main, pwallet->cs_wallet);
     try {
         int nMinVersion = 0;
         if (batch.Read((std::string) "minversion", nMinVersion)) {
@@ -818,7 +826,7 @@ bool CWalletDB::RecoverKeysOnlyFilter(void *callbackData, CDataStream ssKey,
     bool fReadOK;
     {
         // Required in LoadKeyMetadata():
-        LOCK(dummyWallet->cs_wallet);
+        LOCK2(cs_main, dummyWallet->cs_wallet);
         fReadOK = ReadKeyValue(dummyWallet, ssKey, ssValue, dummyWss, strType,
                                strErr);
     }
@@ -857,7 +865,7 @@ bool CWalletDB::WriteDestData(const CTxDestination &address,
     return WriteIC(
         std::make_pair(
             std::string("destdata"),
-            std::make_pair(EncodeLegacyAddr(address, Params()), key)),
+            std::make_pair(EncodeBase58Addr(address, Params()), key)),
         value);
 }
 
@@ -868,7 +876,7 @@ bool CWalletDB::EraseDestData(const CTxDestination &address,
     }
     return EraseIC(std::make_pair(
         std::string("destdata"),
-        std::make_pair(EncodeLegacyAddr(address, Params()), key)));
+        std::make_pair(EncodeBase58Addr(address, Params()), key)));
 }
 
 bool CWalletDB::WriteHDChain(const CHDChain &chain) {

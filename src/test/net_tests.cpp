@@ -1,6 +1,7 @@
 // Copyright (c) 2012-2016 The Bitcoin Core developers
-// Distributed under the MIT software license, see the accompanying
-// file COPYING or http://www.opensource.org/licenses/mit-license.php.
+// Copyright (c) 2019 Bitcoin Association
+// Distributed under the Open BSV software license, see the accompanying file LICENSE.
+
 #include "addrman.h"
 #include "chainparams.h"
 #include "config.h"
@@ -156,33 +157,41 @@ BOOST_AUTO_TEST_CASE(cnode_simple_test) {
     bool fInboundIn = false;
 
     // Test that fFeeler is false by default.
-    std::unique_ptr<CNode> pnode1(new CNode(id++, NODE_NETWORK, height, hSocket,
-                                            addr, 0, 0, pszDest, fInboundIn));
+
+    CConnman::CAsyncTaskPool asyncTaskPool{GlobalConfig::GetConfig()};
+    CNodePtr pnode1 =
+        CNode::Make(
+            id++,
+            NODE_NETWORK,
+            height,
+            hSocket,
+            addr,
+            0u,
+            0u,
+            asyncTaskPool,
+            pszDest,
+            fInboundIn);
     BOOST_CHECK(pnode1->fInbound == false);
     BOOST_CHECK(pnode1->fFeeler == false);
 
     fInboundIn = true;
-    std::unique_ptr<CNode> pnode2(new CNode(id++, NODE_NETWORK, height, hSocket,
-                                            addr, 1, 1, pszDest, fInboundIn));
+    CNodePtr pnode2 =
+        CNode::Make(
+            id++,
+            NODE_NETWORK,
+            height,
+            hSocket,
+            addr,
+            1u,
+            1u,
+            asyncTaskPool,
+            pszDest,
+            fInboundIn);
     BOOST_CHECK(pnode2->fInbound == true);
     BOOST_CHECK(pnode2->fFeeler == false);
 }
 
-BOOST_AUTO_TEST_CASE(test_getSubVersionEB) {
-    BOOST_CHECK_EQUAL(getSubVersionEB(13800000000), "13800.0");
-    BOOST_CHECK_EQUAL(getSubVersionEB(3800000000), "3800.0");
-    BOOST_CHECK_EQUAL(getSubVersionEB(14000000), "14.0");
-    BOOST_CHECK_EQUAL(getSubVersionEB(1540000), "1.5");
-    BOOST_CHECK_EQUAL(getSubVersionEB(1560000), "1.5");
-    BOOST_CHECK_EQUAL(getSubVersionEB(210000), "0.2");
-    BOOST_CHECK_EQUAL(getSubVersionEB(10000), "0.0");
-    BOOST_CHECK_EQUAL(getSubVersionEB(0), "0.0");
-}
-
 BOOST_AUTO_TEST_CASE(test_userAgentLength) {
-    GlobalConfig config;
-
-    config.SetMaxBlockSize(8000000);
     std::string long_uacomment = "very very very very very very very very very "
                                  "very very very very very very very very very "
                                  "very very very very very very very very very "
@@ -193,13 +202,14 @@ BOOST_AUTO_TEST_CASE(test_userAgentLength) {
                                  "very very very very very very long comment";
     gArgs.ForceSetMultiArg("-uacomment", long_uacomment);
 
-    BOOST_CHECK_EQUAL(userAgent(config).size(), MAX_SUBVERSION_LENGTH);
-    BOOST_CHECK_EQUAL(userAgent(config),
-                      "/Bitcoin SV:0.1.0(EB8.0; very very very very very "
+    BOOST_CHECK_EQUAL(userAgent().size(), MAX_SUBVERSION_LENGTH);
+
+    BOOST_CHECK(userAgent().find(
+                      "very very very very very "
                       "very very very very very very very very very very very "
                       "very very very very very very very very very very very "
                       "very very very very very very very very very very very "
-                      "very very very very very very very very)/");
+                      "very very very very very very very v)/") != std::string::npos);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

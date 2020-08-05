@@ -1,6 +1,6 @@
 // Copyright (c) 2017 The Bitcoin developers
-// Distributed under the MIT software license, see the accompanying
-// file COPYING or http://www.opensource.org/licenses/mit-license.php.
+// Copyright (c) 2019 Bitcoin Association
+// Distributed under the Open BSV software license, see the accompanying file LICENSE.
 
 #include "consensus/consensus.h"
 #include "rpc/server.h"
@@ -12,6 +12,7 @@
 #include <boost/test/unit_test.hpp>
 #include <limits>
 #include <string>
+#include <config.h>
 
 extern UniValue CallRPC(std::string strMethod);
 
@@ -29,7 +30,12 @@ BOOST_AUTO_TEST_CASE(excessiveblock_rpc) {
                       std::runtime_error);
     BOOST_CHECK_THROW(CallRPC("setexcessiveblock -1"), boost::bad_lexical_cast);
 
-    BOOST_CHECK_THROW(CallRPC("setexcessiveblock 0"), std::runtime_error);
+    // Check that unlimited value is set properly
+    BOOST_CHECK_NO_THROW(CallRPC("setexcessiveblock 0"));
+    UniValue result{};
+    BOOST_CHECK_NO_THROW(result = CallRPC("getexcessiveblock"););
+    BOOST_CHECK_EQUAL(find_value(result.get_obj(), "excessiveBlockSize").get_int64(), Params().GetDefaultBlockSizeParams().maxBlockSize);
+
     BOOST_CHECK_THROW(CallRPC("setexcessiveblock 1"), std::runtime_error);
     BOOST_CHECK_THROW(CallRPC("setexcessiveblock 1000"), std::runtime_error);
     BOOST_CHECK_THROW(CallRPC(std::string("setexcessiveblock ") +
@@ -44,20 +50,14 @@ BOOST_AUTO_TEST_CASE(excessiveblock_rpc) {
     BOOST_CHECK_NO_THROW(CallRPC(std::string("setexcessiveblock ") +
                                  std::to_string(ONE_MEGABYTE + 10)));
 
-    // The absolute largest block size we are allowed to configure is the max block file size
-    // minus the block header size, minus 1
-    unsigned int ABSOLUTE_MAX_BLOCK_SIZE { MAX_BLOCKFILE_SIZE - BLOCKFILE_BLOCK_HEADER_SIZE - 1 };
+    // Test that we are alowed to exceed blockfile size
     BOOST_CHECK_NO_THROW(CallRPC(std::string("setexcessiveblock ") +
-                         std::to_string(ABSOLUTE_MAX_BLOCK_SIZE - 1)));
-    BOOST_CHECK_NO_THROW(CallRPC(std::string("setexcessiveblock ") +
-                         std::to_string(ABSOLUTE_MAX_BLOCK_SIZE)));
-    BOOST_CHECK_THROW(CallRPC(std::string("setexcessiveblock ") +
-                      std::to_string(ABSOLUTE_MAX_BLOCK_SIZE + 1)),
-                      std::runtime_error);
+                         std::to_string(DEFAULT_PREFERRED_BLOCKFILE_SIZE * 100)));
 
     // Default can be higher than 1MB in future - test it too
+    auto nDefaultMaxBlockSize = GlobalConfig::GetConfig().GetMaxBlockSize();
     BOOST_CHECK_NO_THROW(CallRPC(std::string("setexcessiveblock ") +
-                                 std::to_string(DEFAULT_MAX_BLOCK_SIZE)));
+                                 std::to_string(nDefaultMaxBlockSize)));
 }
 
 BOOST_AUTO_TEST_SUITE_END()

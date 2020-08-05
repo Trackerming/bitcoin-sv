@@ -1,50 +1,39 @@
-# Bitcoin SV version 0.1.0 Release Notes
+# Bitcoin SV version 1.0.4 Release Notes
 
-This release includes support for the November 2018 Upgrade. When the upgrade activates, the 
-following changes take effect:
- - The opcodes OP_MUL, OP_INVERT, OP_LSHIFT, & OP_RSHIFT are re-enabled
- - The limit on the number of opcodes per script is increased to 500
- - The default maximum size of accepted blocks = 128MB
- 
-The following features are also included in this release:
- - Disabled the automatic replay protection feature
+The Swift 1.0.4 release focuses primarily on performance-related issues.
 
-## Known Issues
-This release has the following known issues:
+Note that if the minimum mempool size is now less than 30% of the default
+mempool size, the node will not start.
 
-* SV-30 - if excessiveblocksize has not been manually configured, the following fields report the
-post-upgrade value (128MB) before the upgrade has taken place
-  * maxblocksize field in the results from RPC getinfo
-  * excessiveBlockSize field in the results from RPC getexcessiveblock
-  * EB field in the P2P useragent string
+## List of Changes since 1.0.3
+* Gitian build fix: instruction[_iterator].h location in Makefile.am.
+* Ban nodes that violate the `maxscriptnumlengthpolicy` policy setting.
+* Fix race condition in bsv-trigger-safe-mode-by-invalid-chain.py.
+* Fix: bug in thread pool tests.
+* Fix: Failing unit tests in debug on develop branch.
+* Fix: P2P stops sending data under some circumstances.
+* Remove excess physical dependencies (#includes) on script.h.
+* Fix: Missing debug flags in CMake.
+* Minimum mempool size should be at least 30% of default mempool size.
+* Optimise frequent malloc calls in GetOp2.
+* Reduce the number of orphan transactions during PTV processing.
+* Windows build; Separate running tests from C++ build.
+* Fix: formatting of floating point number in log messages.
+* Implement caching invalid signatures.
+* Fix: P2P getaddr returns very polluted results.
+* Increase default script cache size to improve performance with large blocks.
+* Fix: Failing functional tests.
 
-## List of Changes
-* November 2018 Upgrade activation logic
-* Re-enabled opcodes OP_MUL, OP_INVERT, OP_LSHIFT, & OP_RSHIFT (takes affect after Nov 2018 upgrade)
-* Increased limit on the number of opcodes per script to 500 (takes affect after Nov 2018 upgrade)
-* Increased default size of accepted blocks to 128MB  (takes affect after Nov 2018 upgrade)
-* Reduced the maximum size of P2P messages to be closer to the `excessiveblocksize`
-* Removed the Automatic Replay Protection feature
-* Removed activation logic for the May 2018 upgrade
-* Removed the GUI
-* Made the `excessiveblocksize` a standard parameter (was debug)
-* Added `excessiveblocksize` and `maxblocksize` to RPC getinfo
-* Fix for CVE-2018-17144
+## Scaling Test Network (STN) Reset
+N/A
 
-## List of Tests
-* Unit Tests
-* Python functional tests
-* System tests:
-  * Validate that the default excessive block size does not change prior to the hardfork
-  * Validate that the excessive block size setting is defaulted to 128MB after hard fork
-  * Validate that the excessive block size setting remains 128MB after hard fork
-  * Validate the excessive block size setting is unchanged after hard fork
-  * Validate the max generated block size is defaulted to 32MB prior to hard fork
-  * Validate the max generated block size is defaulted to 32MB after the hard fork
-  * Validate that scripts with >201 op codes are rejected before magnetic activation
-  * Validate that scripts with >201 op codes are handled after magnetic activation
-  * Validate that scripts with >500 op codes are rejected after magnetic activation
-  * Validate rejection of all 4 Opcodes (OP_MUL, OP_LSHIFT, OP_RSHIFT, OP_INVERT) prior to magentic activation
-  * Validate that an infinite block attack is declined and the node disconnected
-
-All tests passed.
+# Previous Releases
+* [Version 0.1.0](release-notes-v0.1.0.md) - [Download](https://download.bitcoinsv.io/bitcoinsv/0.1.0/) - [Source](https://github.com/bitcoin-sv/bitcoin-sv/tree/v0.1.0) - 2018-10-15
+* [Version 0.1.1](release-notes-v0.1.1.md) - [Download](https://download.bitcoinsv.io/bitcoinsv/0.1.1/) - [Source](https://github.com/bitcoin-sv/bitcoin-sv/tree/v0.1.1) - 2019-02-11
+* [Version 0.2.0](release-notes-v0.2.0.md) - [Download](https://download.bitcoinsv.io/bitcoinsv/0.2.0/) - [Source](https://github.com/bitcoin-sv/bitcoin-sv/tree/v0.2.0) - 2019-06-05
+* [Version 0.2.1](release-notes-v0.2.1.md) - [Download](https://download.bitcoinsv.io/bitcoinsv/0.2.1/) - [Source](https://github.com/bitcoin-sv/bitcoin-sv/tree/v0.2.1) - 2019-07-12
+* [Version 0.2.2.beta](release-notes-v0.2.2-beta.md) - [Download](https://download.bitcoinsv.io/bitcoinsv/0.2.2.beta/) - [Source](https://github.com/bitcoin-sv/bitcoin-sv/tree/v0.2.2.beta) - 2019-10-30
+* [Version 1.0.0](release-notes-v1.0.0.md) - [Download](https://download.bitcoinsv.io/bitcoinsv/1.0.0/) - [Source](https://github.com/bitcoin-sv/bitcoin-sv/tree/v1.0.0) - 2020-01-15
+* [Version 1.0.1](release-notes-v1.0.1.md) - [Download](https://download.bitcoinsv.io/bitcoinsv/1.0.1/) - [Source](https://github.com/bitcoin-sv/bitcoin-sv/tree/v1.0.1) - 2020-01-28
+* [Version 1.0.2](release-notes-v1.0.2.md) - [Download](https://download.bitcoinsv.io/bitcoinsv/1.0.2/) - [Source](https://github.com/bitcoin-sv/bitcoin-sv/tree/v1.0.2) - 2020-02-17
+* [Version 1.0.3](release-notes-v1.0.3.md) - [Download](https://download.bitcoinsv.io/bitcoinsv/1.0.3/) - [Source](https://github.com/bitcoin-sv/bitcoin-sv/tree/v1.0.3) - 2020-04-28

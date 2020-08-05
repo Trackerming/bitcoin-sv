@@ -1,6 +1,6 @@
 // Copyright (c) 2016 The Bitcoin Core developers
-// Distributed under the MIT software license, see the accompanying
-// file COPYING or http://www.opensource.org/licenses/mit-license.php.
+// Copyright (c) 2018-2019 Bitcoin Association
+// Distributed under the Open BSV software license, see the accompanying file LICENSE.
 
 #include "bench.h"
 
@@ -8,6 +8,8 @@
 #include "consensus/validation.h"
 #include "streams.h"
 #include "validation.h"
+#include "chainparams.h"
+#include "init.h"
 
 namespace block_bench {
 #include "bench/data/block413567.raw.h"
@@ -40,7 +42,10 @@ static void DeserializeAndCheckBlockTest(benchmark::State &state) {
     char a;
     stream.write(&a, 1); // Prevent compaction
 
-    const Config &config = GlobalConfig::GetConfig();
+    SelectParams(CBaseChainParams::MAIN);
+    Config &config = GlobalConfig::GetConfig();
+    assert(AppInitParameterInteraction(config));
+
     while (state.KeepRunning()) {
         // Note that CBlock caches its checked state, so we need to recreate it
         // here.
@@ -49,7 +54,7 @@ static void DeserializeAndCheckBlockTest(benchmark::State &state) {
         assert(stream.Rewind(sizeof(block_bench::block413567)));
 
         CValidationState validationState;
-        assert(CheckBlock(config, block, validationState));
+        assert(CheckBlock(config, block, validationState, 413567));
     }
 }
 

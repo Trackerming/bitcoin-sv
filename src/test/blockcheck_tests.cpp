@@ -1,6 +1,6 @@
 // Copyright (c) 2013-2015 The Bitcoin Core developers
-// Distributed under the MIT software license, see the accompanying
-// file COPYING or http://www.opensource.org/licenses/mit-license.php.
+// Copyright (c) 2019 Bitcoin Association
+// Distributed under the Open BSV software license, see the accompanying file LICENSE.
 
 #include "chainparams.h"
 #include "config.h"
@@ -19,7 +19,7 @@ static void RunCheckOnBlockImpl(const GlobalConfig &config, const CBlock &block,
     block.fChecked = false;
     BlockValidationOptions validationOptions =
         BlockValidationOptions(false, false);
-    bool fValid = CheckBlock(config, block, state, validationOptions);
+    bool fValid = CheckBlock(config, block, state, 0, validationOptions);
 
     BOOST_CHECK_EQUAL(fValid, expected);
     BOOST_CHECK_EQUAL(fValid, state.IsValid());
@@ -43,11 +43,12 @@ BOOST_AUTO_TEST_CASE(blockfail) {
     SelectParams(CBaseChainParams::MAIN);
 
     // Set max blocksize to default in case other tests left it dirty
-    GlobalConfig config;
-    config.SetMaxBlockSize(DEFAULT_MAX_BLOCK_SIZE);
+    testConfig.SetDefaultBlockSizeParams(Params().GetDefaultBlockSizeParams());
+    testConfig.SetMaxBlockSize(128*ONE_MEGABYTE);
+    auto nDefaultMaxBlockSize = testConfig.GetMaxBlockSize();
 
     CBlock block;
-    RunCheckOnBlock(config, block, "bad-cb-missing");
+    RunCheckOnBlock(testConfig, block, "bad-cb-missing");
 
     CMutableTransaction tx;
 
@@ -60,26 +61,26 @@ BOOST_AUTO_TEST_CASE(blockfail) {
 
     block.vtx.resize(1);
     block.vtx[0] = MakeTransactionRef(tx);
-    RunCheckOnBlock(config, block);
+    RunCheckOnBlock(testConfig, block);
 
     // No coinbase
     tx.vin[0].prevout = COutPoint(InsecureRand256(), 0);
     block.vtx[0] = MakeTransactionRef(tx);
 
-    RunCheckOnBlock(config, block, "bad-cb-missing");
+    RunCheckOnBlock(testConfig, block, "bad-cb-missing");
 
     // Invalid coinbase
     tx = CMutableTransaction(coinbaseTx);
     tx.vin[0].scriptSig.resize(0);
     block.vtx[0] = MakeTransactionRef(tx);
 
-    RunCheckOnBlock(config, block, "bad-cb-length");
+    RunCheckOnBlock(testConfig, block, "bad-cb-length");
 
     // Oversize block.
     tx = CMutableTransaction(coinbaseTx);
     block.vtx[0] = MakeTransactionRef(tx);
     auto txSize = ::GetSerializeSize(tx, SER_NETWORK, PROTOCOL_VERSION);
-    auto maxTxCount = ((DEFAULT_MAX_BLOCK_SIZE - 1) / txSize) - 1;
+    auto maxTxCount = ((nDefaultMaxBlockSize - 1) / txSize) - 1;
 
     for (size_t i = 1; i < maxTxCount; i++) {
         tx.vin[0].prevout = COutPoint(InsecureRand256(), 0);
@@ -87,13 +88,46 @@ BOOST_AUTO_TEST_CASE(blockfail) {
     }
 
     // Check that at this point, we still accept the block.
-    RunCheckOnBlock(config, block);
+    RunCheckOnBlock(testConfig, block);
+
+    // And that serialisation works for large blocks
+    CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
+    ss << block;
+    CBlock unserblock;
+    ss >> unserblock;
+    BOOST_CHECK(block.vtx.size() == unserblock.vtx.size());
 
     // But reject it with one more transaction as it goes over the maximum
     // allowed block size.
     tx.vin[0].prevout = COutPoint(InsecureRand256(), 0);
     block.vtx.push_back(MakeTransactionRef(tx));
-    RunCheckOnBlock(config, block, "bad-blk-length");
+    RunCheckOnBlock(testConfig, block, "bad-blk-length");
+
+	// Bounds checking within GetHeightFromCoinbase()
+    block.vtx.resize(1);
+    block.vtx[0] = MakeTransactionRef(tx);
 }
 
+BOOST_AUTO_TEST_CASE(block_bounds_check)
+{
+    SelectParams(CBaseChainParams::MAIN);
+
+    /* Bounds checking within GetHeightFromCoinbase() */
+
+    // Invalid coinbase script which mis-reports length
+    CMutableTransaction tx {};
+    tx.vin.resize(1);
+    tx.vin[0].scriptSig.resize(1);
+    tx.vin[0].scriptSig[0] = 0xff;
+    tx.vout.resize(1);
+    tx.vout[0].nValue = Amount(42);
+    auto coinbaseTx = CTransaction(tx);
+    CBlock block {};
+    block.vtx.resize(1);
+    block.vtx[0] = MakeTransactionRef(tx);
+
+    // GetHeightFromCoinbase() should throw
+    BOOST_CHECK_THROW(block.GetHeightFromCoinbase(), std::runtime_error);
+}
+ 
 BOOST_AUTO_TEST_SUITE_END()

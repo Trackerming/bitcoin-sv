@@ -1,7 +1,7 @@
 // Copyright (c) 2009-2010 Satoshi Nakamoto
 // Copyright (c) 2009-2016 The Bitcoin Core developers
-// Distributed under the MIT software license, see the accompanying
-// file COPYING or http://www.opensource.org/licenses/mit-license.php.
+// Copyright (c) 2019 Bitcoin Association
+// Distributed under the Open BSV software license, see the accompanying file LICENSE.
 
 #include "protocol.h"
 
@@ -41,6 +41,7 @@ const char *SENDCMPCT = "sendcmpct";
 const char *CMPCTBLOCK = "cmpctblock";
 const char *GETBLOCKTXN = "getblocktxn";
 const char *BLOCKTXN = "blocktxn";
+const char *PROTOCONF = "protoconf";
 
 bool IsBlockLike(const std::string &strCommand) {
     return strCommand == NetMsgType::BLOCK ||
@@ -62,28 +63,28 @@ static const std::string allNetMessageTypes[] = {
     NetMsgType::NOTFOUND,    NetMsgType::FILTERLOAD, NetMsgType::FILTERADD,
     NetMsgType::FILTERCLEAR, NetMsgType::REJECT,     NetMsgType::SENDHEADERS,
     NetMsgType::FEEFILTER,   NetMsgType::SENDCMPCT,  NetMsgType::CMPCTBLOCK,
-    NetMsgType::GETBLOCKTXN, NetMsgType::BLOCKTXN,
+    NetMsgType::GETBLOCKTXN, NetMsgType::BLOCKTXN,   NetMsgType::PROTOCONF,
 };
 static const std::vector<std::string>
     allNetMessageTypesVec(allNetMessageTypes,
                           allNetMessageTypes + ARRAYLEN(allNetMessageTypes));
 
 CMessageHeader::CMessageHeader(const MessageMagic &pchMessageStartIn) {
-    memcpy(std::begin(pchMessageStart), std::begin(pchMessageStartIn),
+    memcpy(pchMessageStart.data(), pchMessageStartIn.data(),
            MESSAGE_START_SIZE);
     memset(pchCommand, 0, sizeof(pchCommand));
-    nMessageSize = -1;
+    nPayloadLength = -1;
     memset(pchChecksum, 0, CHECKSUM_SIZE);
 }
 
 CMessageHeader::CMessageHeader(const MessageMagic &pchMessageStartIn,
                                const char *pszCommand,
-                               unsigned int nMessageSizeIn) {
-    memcpy(std::begin(pchMessageStart), std::begin(pchMessageStartIn),
+                               unsigned int nPayloadLengthIn) {
+    memcpy(pchMessageStart.data(), pchMessageStartIn.data(),
            MESSAGE_START_SIZE);
     memset(pchCommand, 0, sizeof(pchCommand));
     strncpy(pchCommand, pszCommand, COMMAND_SIZE);
-    nMessageSize = nMessageSizeIn;
+    nPayloadLength = nPayloadLengthIn;
     memset(pchChecksum, 0, CHECKSUM_SIZE);
 }
 
@@ -96,7 +97,7 @@ static bool
 CheckHeaderMagicAndCommand(const CMessageHeader &header,
                            const CMessageHeader::MessageMagic &magic) {
     // Check start string
-    if (memcmp(std::begin(header.pchMessageStart), std::begin(magic),
+    if (memcmp(header.pchMessageStart.data(), magic.data(),
                CMessageHeader::MESSAGE_START_SIZE) != 0) {
         return false;
     }
@@ -130,7 +131,7 @@ bool CMessageHeader::IsValid(const Config &config) const {
     // Message size
     if (IsOversized(config)) {
         LogPrintf("CMessageHeader::IsValid(): (%s, %u bytes) is oversized\n",
-                  GetCommand(), nMessageSize);
+                  GetCommand(), nPayloadLength);
         return false;
     }
 
@@ -150,30 +151,51 @@ bool CMessageHeader::IsValidWithoutConfig(const MessageMagic &magic) const {
         return false;
     }
 
-    // Message size
-    if (nMessageSize > MAX_PROTOCOL_MESSAGE_LENGTH) {
+    // Payload size
+    if (nPayloadLength > MAX_PROTOCOL_RECV_PAYLOAD_LENGTH) {
         LogPrintf(
             "CMessageHeader::IsValidForSeeder(): (%s, %u bytes) is oversized\n",
-            GetCommand(), nMessageSize);
+            GetCommand(), nPayloadLength);
         return false;
     }
 
     return true;
 }
 
-bool CMessageHeader::IsOversized(const Config &config) const {
-    // If the message doesn't not contain a block content, check against
-    // MAX_PROTOCOL_MESSAGE_LENGTH.
-    if (nMessageSize > MAX_PROTOCOL_MESSAGE_LENGTH &&
-        !NetMsgType::IsBlockLike(GetCommand())) {
-        return true;
-    }
+bool CMessageHeader::IsOversized(const Config &config) const 
+{
+    const std::string command = GetCommand();
 
+    // If the message is PROTOCONF, it is limited to LEGACY_MAX_PROTOCOL_PAYLOAD_LENGTH.
+    if (command == NetMsgType::PROTOCONF)
+    {
+        if (nPayloadLength > LEGACY_MAX_PROTOCOL_PAYLOAD_LENGTH)
+        {
+            return true;
+        }
+    }
+    // If the message is TX, it is limited to max consensus tx size after Genesis
+    // can not use policy limit because of banning rules.
+    else if (command == NetMsgType::TX)
+    {
+        if (nPayloadLength > config.GetMaxTxSize(true, true))
+        {
+            return true;
+        }   
+    }
+    // If the message doesn't not contain a block content, check against MAX_PROTOCOL_RECV_PAYLOAD_LENGTH.
+    else if (!NetMsgType::IsBlockLike(command))
+    {
+        if (nPayloadLength > MAX_PROTOCOL_RECV_PAYLOAD_LENGTH)
+        {
+            return true;
+        }
+    }
     // maximum accepted size with the block size.
-    if (nMessageSize > config.GetMaxBlockSize()) {
+    else if (nPayloadLength > config.GetMaxBlockSize()) 
+    {
         return true;
     }
-
     return false;
 }
 

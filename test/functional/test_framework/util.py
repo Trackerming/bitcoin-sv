@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 # Copyright (c) 2014-2016 The Bitcoin Core developers
-# Distributed under the MIT software license, see the accompanying
-# file COPYING or http://www.opensource.org/licenses/mit-license.php.
+# Copyright (c) 2019 Bitcoin Association
+# Distributed under the Open BSV software license, see the accompanying file LICENSE.
 """Helpful routines for regression testing."""
 
 from base64 import b64encode
 from binascii import hexlify, unhexlify
 from decimal import Decimal, ROUND_DOWN
+import glob
 import hashlib
 import json
 import logging
@@ -230,7 +231,7 @@ def satoshi_round(amount):
     return Decimal(amount).quantize(Decimal('0.00000001'), rounding=ROUND_DOWN)
 
 
-def wait_until(predicate, *, attempts=float('inf'), timeout=float('inf'), lock=None):
+def wait_until(predicate, *, attempts=float('inf'), timeout=float('inf'), lock=None, check_interval=0.05, label="wait_until"):
     if attempts == float('inf') and timeout == float('inf'):
         timeout = 60
     attempt = 0
@@ -245,11 +246,11 @@ def wait_until(predicate, *, attempts=float('inf'), timeout=float('inf'), lock=N
             if predicate():
                 return
         attempt += 1
-        time.sleep(0.05)
+        time.sleep(check_interval)
 
     # Print the cause of the timeout
-    assert_greater_than(attempts, attempt)
-    assert_greater_than(timeout, time.time())
+    assert attempts >= attempt, f"{label} : max attempts exceeeded (attempts={attempt})"
+    assert timeout >= time.time(), f"{label} : timeout exceeded {timeout}"
     raise RuntimeError('Unreachable')
 
 # RPC/P2P connection constants and functions
@@ -329,9 +330,8 @@ def initialize_datadir(dirname, n):
         f.write("port=" + str(p2p_port(n)) + "\n")
         f.write("rpcport=" + str(rpc_port(n)) + "\n")
         f.write("listenonion=0\n")
-        f.write("usecashaddr=1\n")
+        f.write("shrinkdebugfile=0\n")
     return datadir
-
 
 def get_datadir_path(dirname, n):
     return os.path.join(dirname, "node" + str(n))
@@ -364,11 +364,6 @@ def log_filename(dirname, n_node, logname):
     return os.path.join(dirname, "node" + str(n_node), "regtest", logname)
 
 
-def get_bip9_status(node, key):
-    info = node.getblockchaininfo()
-    return info['bip9_softforks'][key]
-
-
 def set_node_times(nodes, t):
     for node in nodes:
         node.setmocktime(t)
@@ -399,6 +394,13 @@ def connect_nodes_bi(nodes, a, b):
     connect_nodes(nodes[a], b)
     connect_nodes(nodes[b], a)
 
+def connect_nodes_mesh(nodes, bi=False):
+    for i in range(len(nodes)):
+        for j in range(i + 1, len(nodes)):
+            if bi:
+                connect_nodes_bi(nodes, i, j)
+            else:
+                connect_nodes(nodes[i], j)
 
 def sync_blocks(rpc_connections, *, wait=1, timeout=60):
     """
@@ -447,9 +449,12 @@ def sync_mempools(rpc_connections, *, wait=1, timeout=60):
     """
     while timeout > 0:
         pool = set(rpc_connections[0].getrawmempool())
+        non_final_pool = set(rpc_connections[0].getrawnonfinalmempool())
         num_match = 1
         for i in range(1, len(rpc_connections)):
-            if set(rpc_connections[i].getrawmempool()) == pool:
+            pool_match = set(rpc_connections[i].getrawmempool()) == pool
+            non_final_pool_match = set(rpc_connections[i].getrawnonfinalmempool()) == non_final_pool
+            if pool_match and non_final_pool_match:
                 num_match = num_match + 1
         if num_match == len(rpc_connections):
             return
@@ -673,7 +678,7 @@ def mine_large_block(node, utxos=None):
     if len(utxos) < num:
         utxos.clear()
         utxos.extend(node.listunspent())
-    fee = 100 * node.getnetworkinfo()["relayfee"]
+    fee = 200 * node.getnetworkinfo()["relayfee"]
     create_lots_of_big_transactions(node, txouts, utxos, num, fee=fee)
     node.generate(1)
 
@@ -721,3 +726,21 @@ def get_srcdir(calling_script=None):
 
     # No luck, give up.
     return None
+
+
+def loghash(inhash=None):
+    if inhash:
+        if len(inhash) > 12:
+            return "{" + inhash[:6] + "...." + inhash[-6:] + "}"
+        else:
+            return inhash
+    else:
+        return inhash
+
+
+def check_for_log_msg(log_msg, node_dir):
+    for line in open(glob.glob(node_dir + "/regtest/bitcoind.log")[0]):
+        if log_msg in line:
+            return True
+    return False
+

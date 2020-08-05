@@ -17,6 +17,7 @@ static const uint8_t REJECT_NONSTANDARD = 0x40;
 static const uint8_t REJECT_DUST = 0x41;
 static const uint8_t REJECT_INSUFFICIENTFEE = 0x42;
 static const uint8_t REJECT_CHECKPOINT = 0x43;
+static const uint8_t REJECT_TOOBUSY = 0x44;
 
 /** Capture information about block/transaction validation */
 class CValidationState {
@@ -25,18 +26,20 @@ private:
         MODE_VALID,   //!< everything ok
         MODE_INVALID, //!< network rule violation (DoS value may be set)
         MODE_ERROR,   //!< run-time error
-    } mode;
-    int nDoS;
-    std::string strRejectReason;
-    unsigned int chRejectCode;
-    bool corruptionPossible;
-    std::string strDebugMessage;
+    } mode {MODE_VALID};
+    int nDoS {0};
+    std::string strDebugMessage {};
+    std::string strRejectReason {};
+    unsigned int chRejectCode {0};
+    bool corruptionPossible {false};
+    bool fMissingInputs {false};
+    bool fDoubleSpendDetected {false};
+    bool fMempoolConflictDetected {false};
+    bool nonFinal {false};
+    bool fValidationTimeoutExceeded {false};
+    bool fStandardTx {false};
 
 public:
-    CValidationState()
-        : mode(MODE_VALID), nDoS(0), chRejectCode(0),
-          corruptionPossible(false) {}
-
     bool DoS(int level, bool ret = false, unsigned int chRejectCodeIn = 0,
              const std::string &strRejectReasonIn = "",
              bool corruptionIn = false,
@@ -78,9 +81,24 @@ public:
         }
         return false;
     }
+    bool IsMissingInputs() const { return fMissingInputs; }
+    bool IsDoubleSpendDetected() const { return fDoubleSpendDetected; }
+    bool IsMempoolConflictDetected() const { return fMempoolConflictDetected; }
 
     bool CorruptionPossible() const { return corruptionPossible; }
+    bool IsNonFinal() const { return nonFinal; }
+    bool IsValidationTimeoutExceeded() const { return fValidationTimeoutExceeded; };
+    bool IsStandardTx() const { return fStandardTx; };
+
     void SetCorruptionPossible() { corruptionPossible = true; }
+    void SetMissingInputs() { fMissingInputs = true; }
+    void SetDoubleSpendDetected() { fDoubleSpendDetected = true; }
+    void SetMempoolConflictDetected() { fMempoolConflictDetected = true; }
+    void SetNonFinal(bool nf = true) { nonFinal = nf; }
+    void SetValidationTimeoutExceeded() { fValidationTimeoutExceeded = true; };
+    void SetStandardTx() { fStandardTx = true; };
+
+    int GetNDoS() const { return nDoS; }
     unsigned int GetRejectCode() const { return chRejectCode; }
     std::string GetRejectReason() const { return strRejectReason; }
     std::string GetDebugMessage() const { return strDebugMessage; }

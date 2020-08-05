@@ -1,12 +1,14 @@
 // Copyright (c) 2009-2010 Satoshi Nakamoto
 // Copyright (c) 2009-2016 The Bitcoin Core developers
 // Copyright (c) 2017-2018 The Bitcoin developers
-// Distributed under the MIT software license, see the accompanying
-// file COPYING or http://www.opensource.org/licenses/mit-license.php.
+// Copyright (c) 2019 Bitcoin Association
+// Distributed under the Open BSV software license, see the accompanying file LICENSE.
 
 #include "logging.h"
 #include "util.h"
 #include "utiltime.h"
+
+constexpr auto LOGFILE = "bitcoind.log";
 
 bool fLogIPs = DEFAULT_LOGIPS;
 
@@ -36,7 +38,7 @@ void BCLog::Logger::OpenDebugLog() {
     std::lock_guard<std::mutex> scoped_lock(mutexDebugLog);
 
     assert(fileout == nullptr);
-    fs::path pathDebug = GetDataDir() / "debug.log";
+    fs::path pathDebug = GetDataDir() / LOGFILE;
     fileout = fsbridge::fopen(pathDebug, "a");
     if (fileout) {
         // Unbuffered.
@@ -64,7 +66,6 @@ const CLogCategoryDesc LogCategories[] = {
     {BCLog::ZMQ, "zmq"},
     {BCLog::DB, "db"},
     {BCLog::RPC, "rpc"},
-    {BCLog::ESTIMATEFEE, "estimatefee"},
     {BCLog::ADDRMAN, "addrman"},
     {BCLog::SELECTCOINS, "selectcoins"},
     {BCLog::REINDEX, "reindex"},
@@ -76,6 +77,10 @@ const CLogCategoryDesc LogCategories[] = {
     {BCLog::LIBEVENT, "libevent"},
     {BCLog::COINDB, "coindb"},
     {BCLog::LEVELDB, "leveldb"},
+    {BCLog::TXNPROP, "txnprop"},
+    {BCLog::TXNSRC, "txnsrc"},
+    {BCLog::JOURNAL, "journal"},
+    {BCLog::TXNVAL, "txnval"},
     {BCLog::ALL, "1"},
     {BCLog::ALL, "all"},
 };
@@ -126,7 +131,9 @@ std::string BCLog::Logger::LogTimestampStr(const std::string &str) {
             DateTimeStrFormat("%Y-%m-%d %H:%M:%S", nTimeMicros / 1000000);
         if (fLogTimeMicros)
             strStamped += strprintf(".%06d", nTimeMicros % 1000000);
-        strStamped += ' ' + str;
+
+        std::string strThreadName = "["+GetThreadName()+"]";
+        strStamped += ' ' + strThreadName + ' ' + str;
     } else
         strStamped = str;
 
@@ -159,7 +166,7 @@ int BCLog::Logger::LogPrintStr(const std::string &str) {
             // Reopen the log file, if requested.
             if (fReopenDebugLog) {
                 fReopenDebugLog = false;
-                fs::path pathDebug = GetDataDir() / "debug.log";
+                fs::path pathDebug = GetDataDir() / LOGFILE;
                 if (fsbridge::freopen(pathDebug, "a", fileout) != nullptr) {
                     // unbuffered.
                     setbuf(fileout, nullptr);
@@ -173,12 +180,12 @@ int BCLog::Logger::LogPrintStr(const std::string &str) {
 }
 
 void BCLog::Logger::ShrinkDebugFile() {
-    // Amount of debug.log to save at end when shrinking (must fit in memory)
+    // Amount of LOGFILE to save at end when shrinking (must fit in memory)
     constexpr size_t RECENT_DEBUG_HISTORY_SIZE = 10 * 1000000;
-    // Scroll debug.log if it's getting too big.
-    fs::path pathLog = GetDataDir() / "debug.log";
+    // Scroll LOGFILE if it's getting too big.
+    fs::path pathLog = GetDataDir() / LOGFILE;
     FILE *file = fsbridge::fopen(pathLog, "r");
-    // If debug.log file is more than 10% bigger the RECENT_DEBUG_HISTORY_SIZE
+    // If LOGFILE is more than 10% bigger the RECENT_DEBUG_HISTORY_SIZE
     // trim it down by saving only the last RECENT_DEBUG_HISTORY_SIZE bytes.
     if (file &&
         fs::file_size(pathLog) > 11 * (RECENT_DEBUG_HISTORY_SIZE / 10)) {
@@ -205,7 +212,7 @@ void BCLog::Logger::DisableCategory(LogFlags category) {
     logCategories &= ~category;
 }
 
-bool BCLog::Logger::WillLogCategory(LogFlags category) const {
+bool BCLog::Logger::WillLogCategory(typename std::underlying_type<LogFlags>::type category) const {
     return (logCategories.load(std::memory_order_relaxed) & category) != 0;
 }
 

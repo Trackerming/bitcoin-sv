@@ -1,13 +1,12 @@
 dnl require autoconf 2.60 (AS_ECHO/AS_ECHO_N)
 AC_PREREQ([2.60])
-define(_CLIENT_VERSION_MAJOR, 0)
-define(_CLIENT_VERSION_MINOR, 1)
-define(_CLIENT_VERSION_REVISION, 0)
+define(_CLIENT_VERSION_MAJOR, 1)
+define(_CLIENT_VERSION_MINOR, 0)
+define(_CLIENT_VERSION_REVISION, 4)
 define(_CLIENT_VERSION_BUILD, 0)
-define(_CLIENT_VERSION_IS_RELEASE, true)
-define(_COPYRIGHT_YEAR, 2018)
-define(_COPYRIGHT_HOLDERS,[The %s developers])
-define(_COPYRIGHT_HOLDERS_SUBSTITUTION,[[Bitcoin SV]])
+define(_COPYRIGHT_YEAR, 2020)
+define(_COPYRIGHT_HOLDERS,[The %s Association])
+define(_COPYRIGHT_HOLDERS_SUBSTITUTION,[[Bitcoin]])
 AC_INIT([Bitcoin SV],[_CLIENT_VERSION_MAJOR._CLIENT_VERSION_MINOR._CLIENT_VERSION_REVISION],[https://github.com/bitcoin-sv/bitcoin-sv/issues],[bitcoin-sv],[https://bitcoinsv.io/])
 AC_CONFIG_SRCDIR([src/validation.cpp])
 AC_CONFIG_HEADERS([src/config/bitcoin-config.h])
@@ -54,8 +53,8 @@ case $host in
      lt_cv_deplibs_check_method="pass_all"
   ;;
 esac
-dnl Require C++11 compiler (no GNU extensions)
-AX_CXX_COMPILE_STDCXX([11], [noext], [mandatory], [nodefault])
+dnl Require C++17 compiler (no GNU extensions)
+AX_CXX_COMPILE_STDCXX([17], [noext], [mandatory], [nodefault])
 dnl Check if -latomic is required for <std::atomic>
 CHECK_ATOMIC
 
@@ -89,6 +88,12 @@ AC_PATH_TOOL(CPPFILT, c++filt)
 AC_PATH_TOOL(OBJCOPY, objcopy)
 
 AC_ARG_VAR(PYTHONPATH, Augments the default search path for python module files)
+
+AC_ARG_ENABLE([prod-build],
+  [AS_HELP_STRING([--enable-prod-build],
+  [enable production build (disabled by default)])],
+  [enable_prod_build=$enableval],
+  [enable_prod_build=no])
 
 # Enable wallet
 AC_ARG_ENABLE([wallet],
@@ -160,8 +165,29 @@ AC_ARG_ENABLE([asm],
   [use_asm=$enableval],
   [use_asm=yes])
 
-if test "x$use_asm" = xyes; then
-  AC_DEFINE(USE_ASM, 1, [Define this symbol to build in assembly routines])
+AC_ARG_ENABLE([tcmalloc],
+  [AS_HELP_STRING([--enable-tcmalloc],
+  [Link with Google tcmalloc (default is no)])],
+  [use_tcmalloc=$enableval],
+  [use_tcmalloc=no])
+
+AC_ARG_ENABLE([jemalloc],
+  [AS_HELP_STRING([--enable-jemalloc],
+  [Link with jemalloc (default is no)])],
+  [use_jemalloc=$enableval],
+  [use_jemalloc=no])
+
+dnl setup for production/development build
+AC_MSG_CHECKING([whether production or development build])
+if test x$enable_prod_build != xno; then
+  AC_MSG_RESULT(prod)
+  AC_DEFINE([IS_PRODUCTION_BUILD],[],[Build production])
+  AC_DEFINE(CLIENT_VERSION_IS_RELEASE, true, [Version is release])
+  AC_SUBST(CLIENT_VERSION_IS_RELEASE, true)
+else
+  AC_MSG_RESULT(dev)
+  AC_DEFINE(CLIENT_VERSION_IS_RELEASE, false, [Version is development])
+  AC_SUBST(CLIENT_VERSION_IS_RELEASE, false)
 fi
 
 AC_ARG_WITH([system-univalue],
@@ -194,7 +220,7 @@ AC_ARG_ENABLE([debug],
 # Enable ASAN
 AC_ARG_ENABLE([asan],
     [AS_HELP_STRING([--enable-asan],
-                    [enable address sanitizer compiler flags (implies --enable-debug, default is no)])],
+                    [enable address sanitizer compiler flags (implies --enable-debug, default is no; implies --enable-asm=no, default is yes)])],
     [enable_asan=$enableval],
     [enable_asan=no])
 
@@ -224,6 +250,7 @@ AX_CHECK_COMPILE_FLAG([-Werror],[CXXFLAG_WERROR="-Werror"],[CXXFLAG_WERROR=""])
 
 if test "x$enable_asan" = xyes; then
 	enable_debug=yes
+  use_asm=no
   asan_failed=no
   AX_CHECK_COMPILE_FLAG([-fsanitize=address],
     [CXXFLAGS="$CXXFLAGS -fsanitize=address"],
@@ -240,6 +267,10 @@ if test "x$enable_asan" = xyes; then
   fi
   # fix linkage in MacOs
   [LIBTOOL_APP_LDFLAGS="$LIBTOOL_APP_LDFLAGS -fsanitize=address"],
+fi
+
+if test "x$use_asm" = xyes; then
+  AC_DEFINE(USE_ASM, 1, [Define this symbol to build in assembly routines])
 fi
 
 if test "x$enable_tsan" = xyes; then
@@ -454,11 +485,12 @@ case $host in
          openssl_prefix=`$BREW --prefix openssl 2>/dev/null`
          bdb_prefix=`$BREW --prefix berkeley-db4 2>/dev/null`
          if test x$openssl_prefix != x; then
+           CPPFLAGS="$CPPFLAGS -I$openssl_prefix/include"
            PKG_CONFIG_PATH="$openssl_prefix/lib/pkgconfig:$PKG_CONFIG_PATH"
            export PKG_CONFIG_PATH
          fi
          if test x$bdb_prefix != x; then
-           CPPFLAGS="$CPPFLAGS -I$bdb_prefix/include"
+           BDB_CFLAGS="-I$bdb_prefix/include"
            LIBS="$LIBS -L$bdb_prefix/lib"
          fi
        fi
@@ -485,12 +517,12 @@ case $host in
      fi
 
      AX_CHECK_LINK_FLAG([[-Wl,-headerpad_max_install_names]], [LDFLAGS="$LDFLAGS -Wl,-headerpad_max_install_names"])
-     CPPFLAGS="$CPPFLAGS -DMAC_OSX"
      OBJCXXFLAGS="$CXXFLAGS"
      ;;
    *linux*)
      TARGET_OS=linux
      LEVELDB_TARGET_FLAGS="-DOS_LINUX"
+     AIO_LIBS="-lrt"
      ;;
    *freebsd*)
      LEVELDB_TARGET_FLAGS="-DOS_FREEBSD"
@@ -516,7 +548,7 @@ if test x$use_pkgconfig = xyes; then
 fi
 
 if test x$use_extended_functional_tests != xno; then
-  AC_SUBST(EXTENDED_FUNCTIONAL_TESTS, --extended)
+  AC_SUBST(EXTENDED_FUNCTIONAL_TESTS, --extended --jobs=1)
 fi
 
 if test x$use_lcov = xyes; then
@@ -537,6 +569,18 @@ if test x$use_lcov = xyes; then
     [AC_MSG_ERROR("lcov testing requested but --coverage linker flag does not work")])
   AX_CHECK_COMPILE_FLAG([--coverage],[CXXFLAGS="$CXXFLAGS --coverage"],
     [AC_MSG_ERROR("lcov testing requested but --coverage flag does not work")])
+fi
+
+if test x$use_tcmalloc = xyes; then
+  AC_MSG_RESULT([Enabling tcmalloc])
+  AC_CHECK_LIB([tcmalloc], [malloc],
+    [CXXFLAGS="$CXXFLAGS -fno-builtin-malloc -fno-builtin-calloc -fno-builtin-realloc -fno-builtin-free"; LIBS="-ltcmalloc $LIBS"],
+    [AC_MSG_ERROR(tcmalloc not found)])
+else
+  if test x$use_jemalloc = xyes; then
+    AC_MSG_RESULT([Enabling jemalloc])
+    AC_CHECK_LIB([jemalloc], [malloc],, [AC_MSG_ERROR(jemalloc not found)])
+  fi
 fi
 
 dnl Check for endianness
@@ -589,6 +633,8 @@ if test x$use_glibc_compat != xno; then
     [ fdelt_type="long int"])
   AC_MSG_RESULT($fdelt_type)
   AC_DEFINE_UNQUOTED(FDELT_TYPE, $fdelt_type,[parameter and return value type for __fdelt_chk])
+  AX_CHECK_LINK_FLAG([[-Wl,--wrap=__divmoddi4]], [COMPAT_LDFLAGS="$COMPAT_LDFLAGS -Wl,--wrap=__divmoddi4"])
+  AX_CHECK_LINK_FLAG([[-Wl,--wrap=log2f]], [COMPAT_LDFLAGS="$COMPAT_LDFLAGS -Wl,--wrap=log2f"])
 else
   AC_SEARCH_LIBS([clock_gettime],[rt])
 fi
@@ -757,7 +803,7 @@ fi
 if test x$use_boost = xyes; then
 
 dnl Minimum required Boost version
-define(MINIMUM_REQUIRED_BOOST, 1.58.0)
+define(MINIMUM_REQUIRED_BOOST, 1.59.0)
 
 dnl Check for boost libs
 AX_BOOST_BASE([MINIMUM_REQUIRED_BOOST])
@@ -928,8 +974,10 @@ if test x$use_pkgconfig = xyes; then
   m4_ifdef(
     [PKG_CHECK_MODULES],
     [
-      PKG_CHECK_MODULES([SSL], [libssl],, [AC_MSG_ERROR(openssl  not found.)])
+      PKG_CHECK_MODULES([SSL], [libssl],, [AC_MSG_ERROR(libssl  not found.)])
       PKG_CHECK_MODULES([CRYPTO], [libcrypto],,[AC_MSG_ERROR(libcrypto  not found.)])
+      OPENSSL_LIBS="$SSL_LIBS $CRYPTO_LIBS"
+
       if test x$build_bitcoin_utils$build_bitcoind$use_tests != xnonono; then
         PKG_CHECK_MODULES([EVENT], [libevent],, [AC_MSG_ERROR(libevent not found.)])
         if test x$TARGET_OS != xwindows; then
@@ -950,10 +998,11 @@ if test x$use_pkgconfig = xyes; then
   )
 else
   AC_CHECK_HEADER([openssl/crypto.h],,AC_MSG_ERROR(libcrypto headers missing))
-  AC_CHECK_LIB([crypto],      [main],CRYPTO_LIBS=-lcrypto, AC_MSG_ERROR(libcrypto missing))
+  AC_CHECK_LIB([crypto],      [main],CRYPTO_LIBS=-lcrypto, AC_MSG_ERROR(libcrypto not found.))
 
   AC_CHECK_HEADER([openssl/ssl.h],, AC_MSG_ERROR(libssl headers missing),)
-  AC_CHECK_LIB([ssl],         [main],SSL_LIBS=-lssl, AC_MSG_ERROR(libssl missing))
+  AC_CHECK_LIB([ssl],         [main],SSL_LIBS=-lssl, AC_MSG_ERROR(libssl not found.))
+  OPENSSL_LIBS="$SSL_LIBS $CRYPTO_LIBS"
 
   if test x$build_bitcoin_utils$build_bitcoind$use_tests != xnonono; then
     AC_CHECK_HEADER([event2/event.h],, AC_MSG_ERROR(libevent headers missing),)
@@ -1158,7 +1207,6 @@ AC_DEFINE(CLIENT_VERSION_MAJOR, _CLIENT_VERSION_MAJOR, [Major version])
 AC_DEFINE(CLIENT_VERSION_MINOR, _CLIENT_VERSION_MINOR, [Minor version])
 AC_DEFINE(CLIENT_VERSION_REVISION, _CLIENT_VERSION_REVISION, [Build revision])
 AC_DEFINE(CLIENT_VERSION_BUILD, _CLIENT_VERSION_BUILD, [Version Build])
-AC_DEFINE(CLIENT_VERSION_IS_RELEASE, _CLIENT_VERSION_IS_RELEASE, [Version is release])
 AC_DEFINE(COPYRIGHT_YEAR, _COPYRIGHT_YEAR, [Copyright year])
 AC_DEFINE(COPYRIGHT_HOLDERS, "_COPYRIGHT_HOLDERS", [Copyright holder(s) before %s replacement])
 AC_DEFINE(COPYRIGHT_HOLDERS_SUBSTITUTION, "_COPYRIGHT_HOLDERS_SUBSTITUTION", [Replacement for %s in copyright holders string])
@@ -1168,7 +1216,6 @@ AC_SUBST(CLIENT_VERSION_MAJOR, _CLIENT_VERSION_MAJOR)
 AC_SUBST(CLIENT_VERSION_MINOR, _CLIENT_VERSION_MINOR)
 AC_SUBST(CLIENT_VERSION_REVISION, _CLIENT_VERSION_REVISION)
 AC_SUBST(CLIENT_VERSION_BUILD, _CLIENT_VERSION_BUILD)
-AC_SUBST(CLIENT_VERSION_IS_RELEASE, _CLIENT_VERSION_IS_RELEASE)
 AC_SUBST(COPYRIGHT_YEAR, _COPYRIGHT_YEAR)
 AC_SUBST(COPYRIGHT_HOLDERS, "_COPYRIGHT_HOLDERS")
 AC_SUBST(COPYRIGHT_HOLDERS_SUBSTITUTION, "_COPYRIGHT_HOLDERS_SUBSTITUTION")
@@ -1180,6 +1227,7 @@ AC_SUBST(BITCOIN_SEEDER_NAME)
 
 AC_SUBST(RELDFLAGS)
 AC_SUBST(ERROR_CXXFLAGS)
+AC_SUBST(COMPAT_LDFLAGS)
 AC_SUBST(HARDENED_CXXFLAGS)
 AC_SUBST(HARDENED_CPPFLAGS)
 AC_SUBST(HARDENED_LDFLAGS)
@@ -1193,13 +1241,13 @@ AC_SUBST(TESTDEFS)
 AC_SUBST(LEVELDB_TARGET_FLAGS)
 AC_SUBST(MINIUPNPC_CPPFLAGS)
 AC_SUBST(MINIUPNPC_LIBS)
-AC_SUBST(CRYPTO_LIBS)
-AC_SUBST(SSL_LIBS)
+AC_SUBST(OPENSSL_LIBS)
 AC_SUBST(EVENT_LIBS)
 AC_SUBST(EVENT_PTHREADS_LIBS)
 AC_SUBST(ZMQ_LIBS)
 AC_SUBST(PROTOBUF_LIBS)
 AC_SUBST(QR_LIBS)
+AC_SUBST(AIO_LIBS)
 AC_CONFIG_FILES([Makefile src/Makefile doc/man/Makefile share/setup.nsi test/config.ini])
 AC_CONFIG_FILES([contrib/devtools/split-debug.sh],[chmod +x contrib/devtools/split-debug.sh])
 AC_CONFIG_LINKS([test/functional/test_runner.py:test/functional/test_runner.py])
@@ -1258,6 +1306,7 @@ esac
 
 echo
 echo "Options used to compile and link:"
+echo "  prod build    = $enable_prod_build"
 echo "  with wallet   = $enable_wallet"
 echo "  with zmq      = $use_zmq"
 echo "  with test     = $use_tests"
@@ -1271,6 +1320,10 @@ echo "  sanitizers    "
 echo "          asan  = $enable_asan"
 echo "          tsan  = $enable_tsan"
 echo "          ubsan = $enable_ubsan"
+echo
+echo "  memory allocators"
+echo "       tcmalloc = $use_tcmalloc"
+echo "       jemalloc = $use_jemalloc"
 echo
 echo "  target os     = $TARGET_OS"
 echo "  build os      = $BUILD_OS"

@@ -1,6 +1,6 @@
 // Copyright (c) 2015-2016 The Bitcoin Core developers
-// Distributed under the MIT software license, see the accompanying
-// file COPYING or http://www.opensource.org/licenses/mit-license.php.
+// Copyright (c) 2019 Bitcoin Association
+// Distributed under the Open BSV software license, see the accompanying file LICENSE.
 
 #include "zmqpublishnotifier.h"
 #include "config.h"
@@ -22,7 +22,9 @@ static const char *MSG_RAWTX = "rawtx";
 // Internal function to send multipart message
 static int zmq_send_multipart(void *sock, const void *data, size_t size, ...) {
     va_list args;
+    auto closeVaList = [](va_list* args) {va_end(*args);};
     va_start(args, size);
+    std::unique_ptr<va_list, decltype(closeVaList)> guard{&args, closeVaList};
 
     while (1) {
         zmq_msg_t msg;
@@ -117,7 +119,7 @@ void CZMQAbstractPublishNotifier::Shutdown() {
     psocket = 0;
 }
 
-bool CZMQAbstractPublishNotifier::SendMessage(const char *command,
+bool CZMQAbstractPublishNotifier::SendZMQMessage(const char *command,
                                               const void *data, size_t size) {
     assert(psocket);
 
@@ -140,7 +142,7 @@ bool CZMQPublishHashBlockNotifier::NotifyBlock(const CBlockIndex *pindex) {
     char data[32];
     for (unsigned int i = 0; i < 32; i++)
         data[31 - i] = hash.begin()[i];
-    return SendMessage(MSG_HASHBLOCK, data, 32);
+    return SendZMQMessage(MSG_HASHBLOCK, data, 32);
 }
 
 bool CZMQPublishHashTransactionNotifier::NotifyTransaction(
@@ -150,7 +152,7 @@ bool CZMQPublishHashTransactionNotifier::NotifyTransaction(
     char data[32];
     for (unsigned int i = 0; i < 32; i++)
         data[31 - i] = txid.begin()[i];
-    return SendMessage(MSG_HASHTX, data, 32);
+    return SendZMQMessage(MSG_HASHTX, data, 32);
 }
 
 bool CZMQPublishRawBlockNotifier::NotifyBlock(const CBlockIndex *pindex) {
@@ -170,7 +172,7 @@ bool CZMQPublishRawBlockNotifier::NotifyBlock(const CBlockIndex *pindex) {
         ss << block;
     }
 
-    return SendMessage(MSG_RAWBLOCK, &(*ss.begin()), ss.size());
+    return SendZMQMessage(MSG_RAWBLOCK, &(*ss.begin()), ss.size());
 }
 
 bool CZMQPublishRawTransactionNotifier::NotifyTransaction(
@@ -179,5 +181,5 @@ bool CZMQPublishRawTransactionNotifier::NotifyTransaction(
     LogPrint(BCLog::ZMQ, "zmq: Publish rawtx %s\n", txid.GetHex());
     CDataStream ss(SER_NETWORK, PROTOCOL_VERSION | RPCSerializationFlags());
     ss << transaction;
-    return SendMessage(MSG_RAWTX, &(*ss.begin()), ss.size());
+    return SendZMQMessage(MSG_RAWTX, &(*ss.begin()), ss.size());
 }

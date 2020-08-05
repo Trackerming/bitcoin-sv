@@ -1,7 +1,7 @@
 // Copyright (c) 2009-2010 Satoshi Nakamoto
 // Copyright (c) 2009-2016 The Bitcoin Core developers
-// Distributed under the MIT software license, see the accompanying
-// file COPYING or http://www.opensource.org/licenses/mit-license.php.
+// Copyright (c) 2019 Bitcoin Association
+// Distributed under the Open BSV software license, see the accompanying file LICENSE.
 
 #ifndef BITCOIN_PRIMITIVES_BLOCK_H
 #define BITCOIN_PRIMITIVES_BLOCK_H
@@ -42,6 +42,9 @@ public:
         READWRITE(nNonce);
     }
 
+    // Returns header size in bytes
+    size_t GetHeaderSize();
+
     void SetNull() {
         nVersion = 0;
         hashPrevBlock.SetNull();
@@ -81,6 +84,16 @@ public:
         READWRITE(vtx);
     }
 
+    uint64_t
+    GetHeightFromCoinbase() const; // Returns the block's height as specified in
+                                   // its coinbase transaction
+
+    // Get number of transactions in block
+    size_t GetTransactionCount();
+
+    // Returns block size in bytes without coinbase transaction
+    size_t GetSizeWithoutCoinbase();
+
     void SetNull() {
         CBlockHeader::SetNull();
         vtx.clear();
@@ -100,6 +113,8 @@ public:
 
     std::string ToString() const;
 };
+
+typedef std::shared_ptr<CBlock> CBlockRef;
 
 /**
  * Describes a place in the block chain to another node such that if the other

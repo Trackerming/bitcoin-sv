@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 # Copyright (c) 2015-2016 The Bitcoin Core developers
 # Copyright (c) 2017 The Bitcoin developers
-# Copyright (c) 2018 The Bitcoin SV developers
-# Distributed under the MIT software license, see the accompanying
-# file COPYING or http://www.opensource.org/licenses/mit-license.php.
+# Copyright (c) 2018-2019 Bitcoin Association
+# Distributed under the Open BSV software license, see the accompanying file LICENSE.
 """
 Test that we spot whether the excessiveblocksize configuration parameter
 is overridden in all cases.
@@ -22,14 +21,6 @@ class BSVEbsOverridden(BitcoinTestFramework):
         self.num_nodes = 1
         self.maxblocksize = 64 * ONE_MEGABYTE
 
-    def test_notset(self):
-        self.log.info("Testing nothing sets excessiveblocksize")
-
-        # Node is already running
-        res = self.nodes[0].getexcessiveblock()
-        assert_equal(res["overridden"], False)
-        return True
-
     def test_fromcmdline(self):
         self.log.info("Testing setting excessiveblocksize from command line")
 
@@ -37,7 +28,7 @@ class BSVEbsOverridden(BitcoinTestFramework):
         self.stop_node(0)
         self.start_node(0, ["-excessiveblocksize=%d" % self.maxblocksize])
         res = self.nodes[0].getexcessiveblock()
-        assert_equal(res["overridden"], True)
+        assert_equal(res["excessiveBlockSize"], self.maxblocksize)
         return True
 
     def test_fromrpc(self):
@@ -46,13 +37,11 @@ class BSVEbsOverridden(BitcoinTestFramework):
         # Stop node and restart
         self.stop_node(0)
         self.start_node(0, [])
-        res = self.nodes[0].getexcessiveblock()
-        assert_equal(res["overridden"], False)
 
         # Set via RPC
         self.nodes[0].setexcessiveblock(self.maxblocksize)
         res = self.nodes[0].getexcessiveblock()
-        assert_equal(res["overridden"], True)
+        assert_equal(res["excessiveBlockSize"], self.maxblocksize)
         return True
 
     def test_fromfile(self):
@@ -65,14 +54,13 @@ class BSVEbsOverridden(BitcoinTestFramework):
             f.write("excessiveblocksize=" + str(self.maxblocksize) + "\n")
         self.start_node(0, [])
         res = self.nodes[0].getexcessiveblock()
-        assert_equal(res["overridden"], True)
+        assert_equal(res["excessiveBlockSize"], self.maxblocksize)
 
         # Remove config file now we've finished with it
         os.remove(filename)
         return True
 
     def run_test(self):
-        self.test_notset()
         self.test_fromcmdline()
         self.test_fromrpc()
         self.test_fromfile()

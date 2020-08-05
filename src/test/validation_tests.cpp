@@ -1,7 +1,7 @@
 // Copyright (c) 2011-2016 The Bitcoin Core developers
 // Copyright (c) 2017 The Bitcoin developers
-// Distributed under the MIT software license, see the accompanying
-// file COPYING or http://www.opensource.org/licenses/mit-license.php.
+// Copyright (c) 2019 Bitcoin Association
+// Distributed under the Open BSV software license, see the accompanying file LICENSE.
 
 #include "chainparams.h"
 #include "config.h"
@@ -49,7 +49,7 @@ BOOST_AUTO_TEST_CASE(validation_load_external_block_file) {
     // serialization format is:
     // message start magic, size of block, block
 
-    size_t nwritten = fwrite(std::begin(chainparams.DiskMagic()),
+    size_t nwritten = fwrite(chainparams.DiskMagic().data(),
                              CMessageHeader::MESSAGE_START_SIZE, 1, fp);
 
     BOOST_CHECK_EQUAL(nwritten, 1UL);
@@ -57,12 +57,12 @@ BOOST_AUTO_TEST_CASE(validation_load_external_block_file) {
     CTransaction empty_tx;
     size_t empty_tx_size = GetSerializeSize(empty_tx, SER_DISK, CLIENT_VERSION);
 
-    size_t num_tx = (10 * MAX_TX_SIZE) / empty_tx_size;
+    size_t num_tx = (10 * MAX_TX_SIZE_CONSENSUS_BEFORE_GENESIS) / empty_tx_size;
 
     CBlock block = makeLargeDummyBlock(num_tx);
 
     BOOST_CHECK(GetSerializeSize(block, SER_DISK, CLIENT_VERSION) >
-                2 * MAX_TX_SIZE);
+                2 * MAX_TX_SIZE_CONSENSUS_BEFORE_GENESIS);
 
     unsigned int size = GetSerializeSize(block, SER_DISK, CLIENT_VERSION);
     {

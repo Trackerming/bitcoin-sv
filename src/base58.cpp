@@ -5,7 +5,6 @@
 #include "base58.h"
 
 #include "hash.h"
-#include "script/script.h"
 #include "uint256.h"
 
 #include <boost/variant/apply_visitor.hpp>
@@ -290,12 +289,12 @@ bool CBitcoinSecret::SetString(const std::string &strSecret) {
     return SetString(strSecret.c_str());
 }
 
-std::string EncodeLegacyAddr(const CTxDestination &dest,
+std::string EncodeBase58Addr(const CTxDestination &dest,
                              const CChainParams &params) {
     return boost::apply_visitor(DestinationEncoder(params), dest);
 }
 
-CTxDestination DecodeLegacyAddr(const std::string &str,
+CTxDestination DecodeBase58Addr(const std::string &str,
                                 const CChainParams &params) {
     return DecodeDestination(str, params);
 }

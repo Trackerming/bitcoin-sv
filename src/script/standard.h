@@ -1,7 +1,7 @@
 // Copyright (c) 2009-2010 Satoshi Nakamoto
 // Copyright (c) 2009-2016 The Bitcoin Core developers
-// Distributed under the MIT software license, see the accompanying
-// file COPYING or http://www.opensource.org/licenses/mit-license.php.
+// Copyright (c) 2019 Bitcoin Association
+// Distributed under the Open BSV software license, see the accompanying file LICENSE.
 
 #ifndef BITCOIN_SCRIPT_STANDARD_H
 #define BITCOIN_SCRIPT_STANDARD_H
@@ -27,7 +27,7 @@ public:
 };
 
 //!< bytes (+1 for OP_RETURN, +2 for the pushdata opcodes)
-static const unsigned int MAX_OP_RETURN_RELAY = 223;
+static const uint64_t DEFAULT_DATA_CARRIER_SIZE = UINT32_MAX;
 extern bool fAcceptDatacarrier;
 
 /**
@@ -75,11 +75,21 @@ typedef boost::variant<CNoDestination, CKeyID, CScriptID> CTxDestination;
 const char *GetTxnOutputType(txnouttype t);
 bool IsValidDestination(const CTxDestination &dest);
 
-bool Solver(const CScript &scriptPubKey, txnouttype &typeRet,
-            std::vector<std::vector<uint8_t>> &vSolutionsRet);
-bool ExtractDestination(const CScript &scriptPubKey,
-                        CTxDestination &addressRet);
-bool ExtractDestinations(const CScript &scriptPubKey, txnouttype &typeRet,
+/**
+ * Return public keys or hashes from scriptPubKey, for 'standard' transaction
+ * types.
+ */
+bool Solver(const CScript& scriptPubKey, bool genesisEnabled, txnouttype& typeRet,
+    std::vector<std::vector<uint8_t>>& vSolutionsRet);
+
+/*
+ * Extract a single destination from P2PK, P2PKH, P2SH
+ */
+bool ExtractDestination(const CScript &scriptPubKey, bool isGenesisEnabled, CTxDestination &addressRet);
+/**
+ * Extracts all destinations from the script. P2PK, P2PKH, P2SH and MULTISIG.
+ */
+bool ExtractDestinations(const CScript &scriptPubKey, bool isGenesisEnabled, txnouttype &typeRet,
                          std::vector<CTxDestination> &addressRet,
                          int &nRequiredRet);
 
